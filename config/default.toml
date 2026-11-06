@@ -1,0 +1,9 @@
+[application]
+name = "ORIGIN TRADER"
+mode = "OBSERVE"
+
+[logging]
+level = "INFO"
+
+[storage]
+database = "data/origin_trader.sqlite3"
