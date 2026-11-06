@@ -158,6 +158,30 @@ External AI services, if introduced, must not receive unrestricted access to the
 
 Secrets and broker credentials must never be committed to source control.
 
+## 9.1 ORIGIN Security Standard
+
+The following principles are foundational across the ORIGIN software family. Each product must apply them through controls appropriate to its platform and purpose; product-specific technologies belong in that product's technical specification.
+
+### Trust boundaries and protected authority
+
+Every ORIGIN product must define its protected assets, trust boundaries, attacker assumptions and residual risks. External data, configuration and autonomous component output must be treated as untrusted until independently validated.
+
+Protected authority includes the permissions, safety limits, approval requirements and emergency controls that bound autonomous components. Intelligence, strategy, learning and self-evolution components must not grant themselves permissions, modify their own safeguards, remove required approvals or authorise their own expansion of authority. Where ordinary software boundaries do not provide sufficient isolation, the product must use stronger platform-enforced boundaries.
+
+### Human authority
+
+Human authority must remain in control of changes to protected policy, production deployment and other designated high-impact actions. An authorisation must apply to the specific action and scope reviewed. An autonomous component must never create or supply its own required human approval.
+
+### Integrity and tamper detection
+
+Important actions and evidence must be traceable. Historical records must be protected against accidental change, and deliberate alteration must be detectable to the extent supported by the product's trusted evidence and key-management model. A local append-only mechanism alone must not be described as tamper-proof. Products using cryptographic verification must document what their signatures establish and where their trusted checkpoints are retained.
+
+### Fail-closed operation and recovery
+
+When required integrity, policy, evidence, permission or approval cannot be verified, the system must enter a restricted state and block unsafe actions. Failures must be visible and investigated, not hidden by automatic repair.
+
+Recovery must preserve suspect evidence, remain explicit and traceable, and never silently rewrite history or establish a new trusted state. The product must document what its controls cannot protect against, including compromise of the operating system or trusted keys where applicable.
+
 ## 10. Testing and Verification
 
 No critical component is considered reliable merely because it runs successfully.

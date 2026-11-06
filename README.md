@@ -8,22 +8,29 @@
 
 ## What is ORIGIN TRADER?
 
-ORIGIN TRADER is an independent trading intelligence platform designed to analyse financial markets, evaluate trading opportunities, manage risk and continuously improve its analytical capabilities.
+ORIGIN TRADER is an independent trading intelligence platform intended to analyse financial markets, evaluate trading opportunities, manage risk and improve its analytical capabilities.
 
-Initially integrated with MetaTrader 5, ORIGIN TRADER is designed to operate as an independent intelligence engine rather than a conventional trading robot.
+The planned initial integration is with MetaTrader 5. ORIGIN TRADER is intended to operate as an independent intelligence engine rather than a conventional trading robot.
 
 It aims to understand market conditions, evaluate its decisions, learn from experience and improve through controlled, evidence-based evolution.
 
-## Core Capabilities
+## Implemented Capabilities
 
-- Market observation and analysis.
-- Statistical and technical intelligence.
-- Trading strategy evaluation.
-- Independent risk governance.
-- Decision monitoring and auditability.
-- Persistent system memory.
-- Continuous intelligence evolution.
-- Controlled autonomous operation.
+- OBSERVE-mode startup status display.
+- TOML configuration loading and validation, restricted to OBSERVE mode.
+- Structured JSON-lines operational logging.
+- A basic SQLite event store supporting event persistence, reopening and schema version checks.
+
+The SQLite store does not provide a reliable append-only guarantee: its current triggers do not prevent all mutation forms, including `INSERT OR REPLACE`. ORIGIN TRADER does not yet implement cryptographic tamper detection or signed audit checkpoints.
+
+## Planned Capabilities
+
+- Read-only MetaTrader 5 market-data integration.
+- Market observation validation, statistical analysis and reporting.
+- Independent risk governance and strategy evaluation.
+- Cryptographic audit records and signed checkpoints.
+- Self-evolution with isolated candidates and independent validation.
+- Controlled execution architecture, subject to future security review and human authorization.
 
 ## The ORIGIN Philosophy
 
@@ -35,15 +42,15 @@ ORIGIN is built around five principles:
 4. Improvements must prove their value.
 5. Autonomy must remain accountable.
 
-## Self-Evolution
+## Self-Evolution Vision
 
-ORIGIN TRADER is designed to evaluate and improve both its trading strategies and its own analytical intelligence.
+ORIGIN TRADER is intended to evaluate and improve both its trading strategies and its analytical intelligence. This capability is planned and is not implemented in the current repository.
 
-Candidate improvements must be tested, independently validated and approved before deployment.
+Candidate improvements will require testing, independent validation and human approval before deployment.
 
-The system cannot independently weaken its protected safety boundaries.
+No autonomous component will be permitted to weaken protected safety boundaries or approve its own deployment.
 
-## Initial Technology
+## Planned Technology Stack
 
 - Python 3.12
 - MetaTrader 5
@@ -57,11 +64,13 @@ The system cannot independently weaken its protected safety boundaries.
 
 **Current stage:** Foundation and architecture.
 
-**Initial objective:** Connect to MetaTrader 5, observe market conditions, analyse historical and current prices, and persist market observations.
+**Implemented today:** OBSERVE-mode startup display, validated configuration, JSON operational logging and a basic SQLite event store.
 
-The initial operating mode is read-only OBSERVE.
+**Planned objective:** Connect to MetaTrader 5 in read-only mode, observe market conditions, analyse historical and current prices, and persist market observations.
 
-No live trading is authorised during initial development.
+ORIGIN TRADER is currently OBSERVE-only. No order execution is implemented, and no live trading is authorised.
+
+Cryptographic tamper detection and signed audit checkpoints are not yet implemented.
 
 ## Project Vision
 
