@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -37,6 +38,10 @@ class StorageError(RuntimeError):
     """Raised when persistent storage cannot operate safely."""
 
 
+class DatabaseMissingError(StorageError):
+    """Raised when an expected database file does not exist."""
+
+
 @dataclass(frozen=True, slots=True)
 class StoredEvent:
     event_id: int
@@ -54,40 +59,171 @@ class SQLiteStore:
         if not raw_path.strip():
             raise ValueError("Database path cannot be empty.")
 
-        if raw_path != ":memory:":
-            Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
-            self._database_path = Path(raw_path).resolve()
-        else:
-            self._database_path = None
+        if raw_path == ":memory:":
+            raise StorageError(
+                "In-memory databases must be explicitly created with "
+                "SQLiteStore.initialize(':memory:')."
+            )
+
+        try:
+            path = Path(raw_path).resolve()
+            path.stat()
+        except FileNotFoundError as exc:
+            raise DatabaseMissingError(
+                f"Expected database does not exist: {Path(raw_path)}"
+            ) from exc
+        except OSError as exc:
+            raise StorageError(
+                f"Could not inspect expected database path: {Path(raw_path)}"
+            ) from exc
+
+        self._database_path = path
 
         self._closed = False
 
         try:
-            # Explicit autocommit keeps transaction boundaries under this
-            # class's control, including DDL and PRAGMA user_version changes.
-            self._connection = sqlite3.connect(
-                raw_path,
-                timeout=5.0,
-                isolation_level=None,
-            )
-            self._connection.row_factory = sqlite3.Row
-            self._connection.execute("PRAGMA foreign_keys = ON")
-            self._connection.execute("PRAGMA busy_timeout = 5000")
-            self._connection.execute("PRAGMA recursive_triggers = ON")
-            recursive_triggers = self._connection.execute(
-                "PRAGMA recursive_triggers"
-            ).fetchone()[0]
-            if recursive_triggers != 1:
-                raise StorageError(
-                    "SQLite recursive triggers could not be enabled."
-                )
+            self._connection = self._connect_existing(path)
+            self._configure_connection()
             self._initialize_schema()
 
+        except DatabaseMissingError:
+            self._close_failed_connection()
+            raise
+        except sqlite3.Error as exc:
+            self._close_failed_connection()
+            try:
+                path.stat()
+            except FileNotFoundError as stat_exc:
+                raise DatabaseMissingError(
+                    f"Expected database does not exist: {path}"
+                ) from stat_exc
+            except OSError as stat_exc:
+                raise StorageError(
+                    f"Could not inspect expected database path: {path}"
+                ) from stat_exc
+            raise StorageError(f"Could not safely open database: {path}") from exc
         except Exception:
-            connection = getattr(self, "_connection", None)
-            if connection is not None:
-                connection.close()
-            self._closed = True
+            self._close_failed_connection()
+            raise
+
+    @staticmethod
+    def _connect_existing(path: Path) -> sqlite3.Connection:
+        """Open a database in read/write mode without SQLite create semantics."""
+
+        uri = f"{path.as_uri()}?mode=rw"
+        return sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=5.0,
+            isolation_level=None,
+        )
+
+    def _configure_connection(self) -> None:
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
+        self._connection.execute("PRAGMA recursive_triggers = ON")
+        recursive_triggers = self._connection.execute(
+            "PRAGMA recursive_triggers"
+        ).fetchone()[0]
+        if recursive_triggers != 1:
+            raise StorageError("SQLite recursive triggers could not be enabled.")
+
+    def _close_failed_connection(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            connection.close()
+        self._closed = True
+
+    @classmethod
+    def initialize(cls, database_path: str | Path) -> "SQLiteStore":
+        """Deliberately create a new database and initialize its schema.
+
+        Existing files are never overwritten. For file databases, O_EXCL makes
+        creation a single-winner operation; a crash after file creation leaves
+        an uninitialized file that normal opening will reject for review.
+        """
+
+        raw_path = str(database_path)
+        if not raw_path.strip():
+            raise ValueError("Database path cannot be empty.")
+
+        store = cls.__new__(cls)
+        store._closed = False
+        store._database_path = None
+
+        if raw_path == ":memory:":
+            try:
+                store._connection = sqlite3.connect(
+                    ":memory:", timeout=5.0, isolation_level=None
+                )
+                store._configure_connection()
+                store._create_initial_schema()
+                return store
+            except Exception:
+                store._close_failed_connection()
+                raise
+
+        path = Path(raw_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path = path.resolve()
+            descriptor = os.open(
+                path,
+                os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                0o600,
+            )
+            os.close(descriptor)
+        except FileExistsError as exc:
+            raise StorageError(
+                f"Database already exists; refusing to initialize or overwrite: {path}"
+            ) from exc
+        except OSError as exc:
+            raise StorageError(f"Could not create database file: {path}") from exc
+
+        store._database_path = path
+        try:
+            store._connection = cls._connect_existing(path)
+            store._configure_connection()
+            store._create_initial_schema()
+            return store
+        except sqlite3.Error as exc:
+            store._close_failed_connection()
+            raise StorageError(f"Could not initialize database: {path}") from exc
+        except Exception:
+            store._close_failed_connection()
+            raise
+
+    def _create_initial_schema(self) -> None:
+        """Create a new schema only through the explicit initialization path."""
+
+        try:
+            self._schema_transaction(self._connection)
+            version = self._connection.execute(
+                "PRAGMA user_version"
+            ).fetchone()[0]
+            objects = self._connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                """
+            ).fetchall()
+            if version != 0 or objects:
+                raise StorageError(
+                    "Database is not empty; refusing initialization."
+                )
+
+            self._connection.execute(_V2_TABLE_SQL)
+            self._install_append_only_triggers()
+            self._connection.execute(
+                f"PRAGMA user_version = {SCHEMA_VERSION}"
+            )
+            self._verify_schema(expected_version=SCHEMA_VERSION)
+            self._connection.commit()
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.rollback()
             raise
 
     def _ensure_open(self) -> None:
@@ -376,33 +512,9 @@ class SQLiteStore:
             )
 
         if version == 0:
-            existing_tables = self._connection.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type = 'table'
-                  AND name NOT LIKE 'sqlite_%'
-                """
-            ).fetchall()
-
-            if existing_tables:
-                raise StorageError(
-                    "Unversioned database contains existing tables."
-                )
-
-            try:
-                self._schema_transaction(self._connection)
-                self._connection.execute(_V2_TABLE_SQL)
-                self._install_append_only_triggers()
-                self._connection.execute(
-                    f"PRAGMA user_version = {SCHEMA_VERSION}"
-                )
-                self._verify_schema(expected_version=SCHEMA_VERSION)
-                self._connection.commit()
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.rollback()
-                raise
+            raise StorageError(
+                "Database has no initialized schema; initialize it explicitly."
+            )
 
         elif version == 1:
             self._migrate_v1_to_v2()

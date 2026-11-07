@@ -1,10 +1,13 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from origin_trader.storage.sqlite_store import (
+    DatabaseMissingError,
     SCHEMA_VERSION,
     SQLiteStore,
     StorageError,
@@ -17,7 +20,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
-            with SQLiteStore(database):
+            with SQLiteStore.initialize(database):
                 self.assertTrue(database.exists())
 
             connection = sqlite3.connect(database)
@@ -32,9 +35,182 @@ class StorageTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_opening_missing_database_fails_without_creating_a_file(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "missing.sqlite3"
+            self.assertFalse(database.exists())
+
+            with self.assertRaisesRegex(DatabaseMissingError, "does not exist"):
+                SQLiteStore(database)
+
+            self.assertFalse(database.exists())
+
+    def test_deleted_established_database_is_not_recreated(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "established.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store.record_event("historical_event", {"value": 7})
+
+            database.unlink()
+            with self.assertRaises(DatabaseMissingError):
+                SQLiteStore(database)
+            self.assertFalse(database.exists())
+
+    def test_initialization_refuses_existing_database_without_overwriting(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "existing.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store.record_event("preserve_me", {"value": 9})
+
+            with self.assertRaisesRegex(StorageError, "already exists"):
+                SQLiteStore.initialize(database)
+
+            self.assertTrue(database.is_file())
+            with SQLiteStore(database) as store:
+                events = store.read_events()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].event_type, "preserve_me")
+            self.assertEqual(events[0].payload, {"value": 9})
+
+    def test_concurrent_initialization_has_one_winner_and_preserves_data(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "concurrent.sqlite3"
+            barrier = Barrier(2)
+
+            def initialize_once():
+                barrier.wait()
+                try:
+                    with SQLiteStore.initialize(database) as store:
+                        store.record_event("winning_initialization")
+                    return "initialized"
+                except StorageError:
+                    return "refused"
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                outcomes = list(executor.map(lambda _: initialize_once(), range(2)))
+
+            self.assertCountEqual(outcomes, ["initialized", "refused"])
+            self.assertTrue(database.is_file())
+            with SQLiteStore(database) as store:
+                events = store.read_events()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].event_type, "winning_initialization")
+
+    def test_initialization_failure_after_exclusive_create_preserves_file(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "interrupted-before-schema.sqlite3"
+
+            with patch.object(
+                SQLiteStore,
+                "_connect_existing",
+                side_effect=sqlite3.OperationalError("injected open failure"),
+            ):
+                with self.assertRaisesRegex(StorageError, "Could not initialize"):
+                    SQLiteStore.initialize(database)
+
+            self.assertTrue(database.is_file())
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 0
+                )
+                objects = connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                    """
+                ).fetchall()
+                self.assertEqual(objects, [])
+            finally:
+                connection.close()
+
+            with self.assertRaises(StorageError):
+                SQLiteStore(database)
+            self.assertTrue(database.is_file())
+            with self.assertRaisesRegex(StorageError, "already exists"):
+                SQLiteStore.initialize(database)
+
+    def test_schema_creation_failure_rolls_back_and_preserves_file(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "interrupted-during-schema.sqlite3"
+
+            def fail_after_schema_ddl(store, expected_version):
+                self.assertEqual(expected_version, SCHEMA_VERSION)
+                names = {
+                    row[0]
+                    for row in store._connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                self.assertIn("system_events", names)
+                self.assertEqual(
+                    store._connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                raise StorageError("injected failure after schema DDL")
+
+            with patch.object(
+                SQLiteStore,
+                "_verify_schema",
+                fail_after_schema_ddl,
+            ):
+                with self.assertRaisesRegex(StorageError, "after schema DDL"):
+                    SQLiteStore.initialize(database)
+
+            self.assertTrue(database.is_file())
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 0
+                )
+                objects = connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                    """
+                ).fetchall()
+                self.assertEqual(objects, [])
+                self.assertEqual(
+                    connection.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
+                )
+            finally:
+                connection.close()
+
+            with self.assertRaises(StorageError):
+                SQLiteStore(database)
+            self.assertTrue(database.is_file())
+            with self.assertRaisesRegex(StorageError, "already exists"):
+                SQLiteStore.initialize(database)
+
+    def test_permission_error_inspecting_database_is_storage_error(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "inaccessible.sqlite3"
+            with patch.object(Path, "stat", side_effect=PermissionError("denied")):
+                with self.assertRaisesRegex(StorageError, "Could not inspect"):
+                    SQLiteStore(database)
+            self.assertFalse(database.exists())
+
+    def test_corrupt_existing_database_is_not_classified_as_missing(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "corrupt.sqlite3"
+            database.write_bytes(b"not a SQLite database")
+
+            with self.assertRaises(StorageError) as raised:
+                SQLiteStore(database)
+
+            self.assertNotIsInstance(raised.exception, DatabaseMissingError)
+            self.assertTrue(database.is_file())
+
     def test_recursive_triggers_are_enabled_on_new_and_reopened_connections(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
 
             for _ in range(2):
                 with SQLiteStore(database) as store:
@@ -47,7 +223,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
-            with SQLiteStore(database) as store:
+            with SQLiteStore.initialize(database) as store:
                 store.record_event("original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
@@ -72,7 +248,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
-            with SQLiteStore(database) as store:
+            with SQLiteStore.initialize(database) as store:
                 store.record_event("original_event", {"value": 1})
 
                 recursive_triggers = store._connection.execute(
@@ -97,7 +273,7 @@ class StorageTests(unittest.TestCase):
     def test_upsert_update_is_rejected(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
-            with SQLiteStore(database) as store:
+            with SQLiteStore.initialize(database) as store:
                 store.record_event("original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
@@ -116,7 +292,7 @@ class StorageTests(unittest.TestCase):
                 connection.close()
 
     def test_ignored_insert_is_not_reported_as_success(self):
-        with SQLiteStore(":memory:") as store:
+        with SQLiteStore.initialize(":memory:") as store:
             store._connection.execute(
                 """
                 CREATE TRIGGER test_ignore_insert
@@ -134,7 +310,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(store.record_event("valid_event"), 1)
 
     def test_failed_insert_rolls_back_and_store_remains_usable(self):
-        with SQLiteStore(":memory:") as store:
+        with SQLiteStore.initialize(":memory:") as store:
             store._connection.execute(
                 """
                 CREATE TRIGGER test_reject_insert
@@ -152,7 +328,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(store.record_event("recovered_event"), 1)
 
     def test_commit_failure_rolls_back_and_does_not_return_event_id(self):
-        with SQLiteStore(":memory:") as store:
+        with SQLiteStore.initialize(":memory:") as store:
             def deny_commit(action, argument1, argument2, database, trigger):
                 if action == sqlite3.SQLITE_TRANSACTION and argument1 == "COMMIT":
                     return sqlite3.SQLITE_DENY
@@ -170,7 +346,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
-            with SQLiteStore(database) as store:
+            with SQLiteStore.initialize(database) as store:
                 event_id = store.record_event(
                     "startup_completed",
                     {"mode": "OBSERVE"},
@@ -186,7 +362,7 @@ class StorageTests(unittest.TestCase):
                 self.assertTrue(events[0].occurred_at_utc.endswith("Z"))
 
     def test_invalid_payload_is_rejected(self):
-        with SQLiteStore(":memory:") as store:
+        with SQLiteStore.initialize(":memory:") as store:
             with self.assertRaises(ValueError):
                 store.record_event(
                     "invalid_event",
@@ -210,7 +386,7 @@ class StorageTests(unittest.TestCase):
                 SQLiteStore(database)
 
     def test_closed_database_rejects_operations(self):
-        store = SQLiteStore(":memory:")
+        store = SQLiteStore.initialize(":memory:")
         store.close()
 
         with self.assertRaises(StorageError):
@@ -220,7 +396,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
-            with SQLiteStore(database) as store:
+            with SQLiteStore.initialize(database) as store:
                 store.record_event("original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
@@ -241,7 +417,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
-            with SQLiteStore(database) as store:
+            with SQLiteStore.initialize(database) as store:
                 store.record_event("original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
@@ -423,7 +599,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "tampered.sqlite3"
 
-            with SQLiteStore(database):
+            with SQLiteStore.initialize(database):
                 pass
 
             connection = sqlite3.connect(database)
@@ -453,7 +629,7 @@ class StorageTests(unittest.TestCase):
     def test_missing_required_trigger_is_rejected(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "missing-trigger.sqlite3"
-            with SQLiteStore(database):
+            with SQLiteStore.initialize(database):
                 pass
             connection = sqlite3.connect(database)
             try:
@@ -467,7 +643,7 @@ class StorageTests(unittest.TestCase):
     def test_unexpected_schema_object_is_rejected(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "unexpected-object.sqlite3"
-            with SQLiteStore(database):
+            with SQLiteStore.initialize(database):
                 pass
             connection = sqlite3.connect(database)
             try:
@@ -483,7 +659,7 @@ class StorageTests(unittest.TestCase):
     def test_unexpected_trigger_is_rejected_when_database_is_reopened(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "unexpected-trigger.sqlite3"
-            with SQLiteStore(database):
+            with SQLiteStore.initialize(database):
                 pass
 
             connection = sqlite3.connect(database)
@@ -507,7 +683,7 @@ class StorageTests(unittest.TestCase):
     def test_altered_table_definition_is_rejected(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "altered-table.sqlite3"
-            with SQLiteStore(database):
+            with SQLiteStore.initialize(database):
                 pass
             connection = sqlite3.connect(database)
             try:
