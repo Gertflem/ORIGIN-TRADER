@@ -331,9 +331,386 @@ class StorageTests(unittest.TestCase):
                 ).fetchone()[0]
 
                 self.assertEqual(version, SCHEMA_VERSION)
-
             finally:
                 connection.close()
+
+    def test_new_file_uses_verified_wal_full_and_connection_policy(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                connection = store._connection
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 2)
+                self.assertEqual(connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 1000)
+                self.assertEqual(connection.execute("PRAGMA locking_mode").fetchone()[0], "normal")
+                self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+                self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA recursive_triggers").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
+
+    def test_in_memory_store_retains_memory_journal_mode(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            self.assertEqual(
+                store._connection.execute("PRAGMA journal_mode").fetchone()[0],
+                "memory",
+            )
+            self.assertEqual(store._connection.execute("PRAGMA synchronous").fetchone()[0], 2)
+            self.assertEqual(store._connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 1000)
+
+    def test_v4_open_rejects_unexpected_journal_mode_without_changing_it(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(StorageError, "journal mode"):
+                SQLiteStore(database)
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            finally:
+                connection.close()
+
+    def test_v4_open_rejects_unsupported_journal_mode(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(connection.execute("PRAGMA journal_mode=MEMORY").fetchone()[0], "memory")
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(StorageError, "journal mode"):
+                SQLiteStore(database)
+
+    def test_independent_store_connections_apply_full_configuration(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            first = SQLiteStore(database)
+            second = SQLiteStore(database)
+            try:
+                for store in (first, second):
+                    connection = store._connection
+                    self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                    self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 2)
+                    self.assertEqual(connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 1000)
+            finally:
+                first.close()
+                second.close()
+
+    def test_separate_process_applies_full_connection_configuration(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            script = textwrap.dedent(
+                """
+                import json, sys
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                store = SQLiteStore(sys.argv[2])
+                values = [
+                    store._connection.execute('PRAGMA journal_mode').fetchone()[0],
+                    store._connection.execute('PRAGMA synchronous').fetchone()[0],
+                    store._connection.execute('PRAGMA wal_autocheckpoint').fetchone()[0],
+                ]
+                print(json.dumps(values))
+                store.close()
+                """
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script, self._source_path(), str(database)],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), ["wal", 2, 1000])
+
+    def test_lock_timeout_rejects_event_without_partial_write(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                blocker = sqlite3.connect(database, isolation_level=None)
+                try:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    with self.assertRaises(StorageError):
+                        _record(store, "blocked_write")
+                    self.assertEqual(store.read_events(), [])
+                finally:
+                    blocker.execute("ROLLBACK")
+                    blocker.close()
+                self.assertEqual(_record(store, "after_lock_release"), 1)
+
+    def test_backup_during_concurrent_writes_is_a_valid_snapshot(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "initial_event")
+                start_writes = Barrier(2)
+
+                def write_events():
+                    with SQLiteStore(database) as writer:
+                        start_writes.wait()
+                        for index in range(100):
+                            _record(writer, "concurrent_event", {"index": index})
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    writer = pool.submit(write_events)
+                    start_writes.wait()
+                    backup_path = store._create_verified_backup(database, version=4)
+                    writer.result(timeout=20)
+
+                backup = sqlite3.connect(backup_path)
+                try:
+                    self.assertEqual(backup.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                    self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                    self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 4)
+                    count = backup.execute("SELECT COUNT(*) FROM system_events").fetchone()[0]
+                    self.assertGreaterEqual(count, 1)
+                    self.assertLessEqual(count, 101)
+                finally:
+                    backup.close()
+
+    def test_backup_verification_rejects_unexpected_journal_mode(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                original = SQLiteStore._configure_connection
+                calls = 0
+
+                def change_reopened_backup_mode(instance):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        instance._connection.execute("PRAGMA journal_mode=DELETE")
+                    return original(instance)
+
+                with patch.object(
+                    SQLiteStore,
+                    "_configure_connection",
+                    change_reopened_backup_mode,
+                ):
+                    with self.assertRaisesRegex(StorageError, "create and verify"):
+                        store._create_verified_backup(database, version=4)
+
+            backups = list(Path(directory).glob("origin.sqlite3.v4-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(backups[0])
+            try:
+                self.assertEqual(
+                    backup.execute("PRAGMA journal_mode").fetchone()[0],
+                    "delete",
+                )
+            finally:
+                backup.close()
+
+    def test_real_reader_lock_blocks_wal_transition_and_retry_succeeds(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "legacy_event", {"preserve": True})
+                store._connection.execute("PRAGMA user_version=3")
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+                    "delete",
+                )
+                connection.execute("PRAGMA user_version=3")
+                connection.commit()
+            finally:
+                connection.close()
+
+            reader = sqlite3.connect(database, isolation_level=None)
+            try:
+                reader.execute("BEGIN")
+                reader.execute("SELECT COUNT(*) FROM system_events").fetchone()
+
+                with self.assertRaisesRegex(StorageError, "safely open database"):
+                    SQLiteStore(database)
+
+                connection = sqlite3.connect(database)
+                try:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0],
+                        3,
+                    )
+                    self.assertEqual(
+                        connection.execute("PRAGMA journal_mode").fetchone()[0],
+                        "delete",
+                    )
+                finally:
+                    connection.close()
+
+                backups = list(
+                    Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3")
+                )
+                self.assertEqual(len(backups), 1)
+                backup = sqlite3.connect(backups[0])
+                try:
+                    self.assertEqual(
+                        backup.execute("PRAGMA user_version").fetchone()[0], 3
+                    )
+                    self.assertEqual(
+                        backup.execute("PRAGMA integrity_check").fetchone()[0],
+                        "ok",
+                    )
+                    self.assertEqual(
+                        backup.execute(
+                            "SELECT event_type FROM system_events"
+                        ).fetchone()[0],
+                        "legacy_event",
+                    )
+                finally:
+                    backup.close()
+            finally:
+                if reader.in_transaction:
+                    reader.execute("ROLLBACK")
+                reader.close()
+
+            with SQLiteStore(database) as store:
+                self.assertEqual(
+                    store._connection.execute("PRAGMA user_version").fetchone()[0],
+                    4,
+                )
+                self.assertEqual(
+                    store._connection.execute("PRAGMA journal_mode").fetchone()[0],
+                    "wal",
+                )
+                events = store.read_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].event_type, "legacy_event")
+
+    def test_v3_wal_policy_migration_preserves_history_and_backup(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "before_v4", {"preserve": True})
+                store._connection.execute("PRAGMA user_version=3")
+            with SQLiteStore(database) as store:
+                events = store.read_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].event_type, "before_v4")
+                self.assertIsNotNone(events[0].idempotency_key)
+                self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone()[0], 4)
+            backups = list(Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(backups[0])
+            try:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(backup.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+                self.assertEqual(backup.execute("SELECT COUNT(*) FROM system_events").fetchone()[0], 1)
+            finally:
+                backup.close()
+
+    def test_legacy_already_in_wal_mode_migrates(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.execute("PRAGMA user_version=3")
+                connection.commit()
+                self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            finally:
+                connection.close()
+            with SQLiteStore(database) as store:
+                self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone()[0], 4)
+
+    def test_v3_transition_failure_keeps_legacy_schema_and_fails_closed(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.execute("PRAGMA user_version=3")
+                connection.commit()
+            finally:
+                connection.close()
+
+            original = SQLiteStore._configure_durability
+
+            def fail_main_transition(instance, *, allow_transition=False):
+                if allow_transition and getattr(instance, "_database_path", None) is not None:
+                    raise StorageError("injected WAL transition failure")
+                return original(instance, allow_transition=allow_transition)
+
+            with patch.object(SQLiteStore, "_configure_durability", fail_main_transition):
+                with self.assertRaisesRegex(StorageError, "injected WAL transition failure"):
+                    SQLiteStore(database)
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            finally:
+                connection.close()
+
+    def test_restart_resumes_after_wal_transition_before_schema_commit(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.execute("PRAGMA user_version=3")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with patch.object(
+                SQLiteStore,
+                "_migrate_v3_to_v4",
+                side_effect=StorageError("injected stop after WAL transition"),
+            ):
+                with self.assertRaisesRegex(StorageError, "injected stop"):
+                    SQLiteStore(database)
+
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            finally:
+                connection.close()
+            with SQLiteStore(database) as store:
+                self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone()[0], 4)
+
+    def test_passive_checkpoint_waits_for_reader_then_completes(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "reader_snapshot")
+                reader = sqlite3.connect(database, isolation_level=None)
+                try:
+                    reader.execute("BEGIN")
+                    reader.execute("SELECT COUNT(*) FROM system_events").fetchone()
+                    _record(store, "after_reader_snapshot")
+                    busy, log_frames, checkpointed = store._connection.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    self.assertGreater(log_frames, 0)
+                    self.assertLess(checkpointed, log_frames)
+                    reader.execute("COMMIT")
+                    busy, log_frames, checkpointed = store._connection.execute(
+                        "PRAGMA wal_checkpoint(FULL)"
+                    ).fetchone()
+                    self.assertEqual(busy, 0)
+                    self.assertEqual(checkpointed, log_frames)
+                finally:
+                    reader.close()
 
     def test_opening_missing_database_fails_without_creating_a_file(self):
         with TemporaryDirectory() as directory:
@@ -780,6 +1157,14 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(events[0].event_type, "legacy_event")
                 self.assertEqual(events[0].payload["value"], 7)
                 self.assertIsNone(events[0].idempotency_key)
+                self.assertEqual(
+                    store._connection.execute("PRAGMA journal_mode").fetchone()[0],
+                    "wal",
+                )
+                self.assertEqual(
+                    store._connection.execute("PRAGMA synchronous").fetchone()[0],
+                    2,
+                )
 
             connection = sqlite3.connect(database)
 
@@ -871,6 +1256,14 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(events[0].occurred_at_utc, "2026-01-02T00:00:00Z")
                 self.assertEqual(events[0].payload, {"n": 2})
                 self.assertIsNone(events[0].idempotency_key)
+                self.assertEqual(
+                    store._connection.execute("PRAGMA journal_mode").fetchone()[0],
+                    "wal",
+                )
+                self.assertEqual(
+                    store._connection.execute("PRAGMA synchronous").fetchone()[0],
+                    2,
+                )
 
             backups = list(
                 Path(directory).glob("legacy-v2.sqlite3.v2-backup-*.sqlite3")
@@ -879,6 +1272,7 @@ class StorageTests(unittest.TestCase):
             backup = sqlite3.connect(backups[0])
             try:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(backup.execute("PRAGMA journal_mode").fetchone()[0], "wal")
                 self.assertEqual(
                     backup.execute("SELECT event_id FROM system_events").fetchone()[0],
                     7,

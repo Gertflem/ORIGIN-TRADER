@@ -12,7 +12,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+_V3_SCHEMA_VERSION = 3
 _V2_SCHEMA_VERSION = 2
 
 _UPDATE_TRIGGER = "system_events_reject_update"
@@ -187,11 +188,57 @@ class SQLiteStore:
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA recursive_triggers = ON")
+        self._connection.execute("PRAGMA locking_mode = NORMAL")
+        self._verify_connection_setting("foreign_keys", 1)
+        self._verify_connection_setting("busy_timeout", 5000)
+        self._verify_connection_setting("locking_mode", "normal")
         recursive_triggers = self._connection.execute(
             "PRAGMA recursive_triggers"
         ).fetchone()[0]
         if recursive_triggers != 1:
             raise StorageError("SQLite recursive triggers could not be enabled.")
+
+    def _verify_connection_setting(self, pragma: str, expected: int | str) -> None:
+        value = self._connection.execute(f"PRAGMA {pragma}").fetchone()[0]
+        if isinstance(expected, str):
+            matches = str(value).lower() == expected.lower()
+        else:
+            matches = value == expected
+        if not matches:
+            raise StorageError(
+                f"SQLite {pragma} setting is {value!r}; expected {expected!r}."
+            )
+
+    def _configure_durability(self, *, allow_transition: bool = False) -> None:
+        mode = str(
+            self._connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if mode != "wal":
+            if not allow_transition or mode != "delete":
+                raise StorageError(
+                    f"SQLite journal mode is {mode!r}; expected 'wal'."
+                )
+            mode = str(
+                self._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            ).lower()
+            if mode != "wal":
+                raise StorageError(
+                    f"SQLite could not enable WAL mode (effective mode: {mode!r})."
+                )
+
+        self._connection.execute("PRAGMA synchronous = FULL")
+        self._verify_connection_setting("synchronous", 2)
+        self._connection.execute("PRAGMA wal_autocheckpoint = 1000")
+        self._verify_connection_setting("wal_autocheckpoint", 1000)
+
+    def _verify_file_durability(self) -> None:
+        mode = str(
+            self._connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        if mode != "wal":
+            raise StorageError(f"SQLite journal mode is {mode!r}; expected 'wal'.")
+        self._verify_connection_setting("synchronous", 2)
+        self._verify_connection_setting("wal_autocheckpoint", 1000)
 
     def _close_failed_connection(self) -> None:
         connection = getattr(self, "_connection", None)
@@ -222,6 +269,10 @@ class SQLiteStore:
                     ":memory:", timeout=5.0, isolation_level=None
                 )
                 store._configure_connection()
+                store._connection.execute("PRAGMA synchronous = FULL")
+                store._verify_connection_setting("synchronous", 2)
+                store._connection.execute("PRAGMA wal_autocheckpoint = 1000")
+                store._verify_connection_setting("wal_autocheckpoint", 1000)
                 store._create_initial_schema()
                 return store
             except Exception:
@@ -249,6 +300,7 @@ class SQLiteStore:
         try:
             store._connection = cls._connect_existing(path)
             store._configure_connection()
+            store._configure_durability(allow_transition=True)
             store._create_initial_schema()
             return store
         except sqlite3.Error as exc:
@@ -286,6 +338,11 @@ class SQLiteStore:
             )
             self._verify_schema(expected_version=SCHEMA_VERSION)
             self._connection.commit()
+            if self._database_path is not None:
+                self._verify_file_durability()
+            else:
+                self._verify_connection_setting("synchronous", 2)
+                self._verify_connection_setting("wal_autocheckpoint", 1000)
         except Exception:
             if self._connection.in_transaction:
                 self._connection.rollback()
@@ -372,7 +429,7 @@ class SQLiteStore:
         }
         if self._connection.execute(
             "PRAGMA user_version"
-        ).fetchone()[0] == SCHEMA_VERSION:
+        ).fetchone()[0] in (_V3_SCHEMA_VERSION, SCHEMA_VERSION):
             expected[_IDEMPOTENCY_TRIGGER] = _IDEMPOTENCY_TRIGGER_SQL
 
         def normalize(sql: str) -> str:
@@ -437,7 +494,7 @@ class SQLiteStore:
                 ("trigger", _DELETE_TRIGGER),
             }
             expected_table_sql = _V2_TABLE_SQL
-        elif expected_version == SCHEMA_VERSION:
+        elif expected_version in (_V3_SCHEMA_VERSION, SCHEMA_VERSION):
             expected_objects = {
                 ("table", "system_events"),
                 ("trigger", _UPDATE_TRIGGER),
@@ -475,7 +532,7 @@ class SQLiteStore:
             ("occurred_at_utc", "TEXT", 1, 0),
             ("payload_json", "TEXT", 1, 0),
         ]
-        if expected_version == SCHEMA_VERSION:
+        if expected_version in (_V3_SCHEMA_VERSION, SCHEMA_VERSION):
             expected_columns.append(("idempotency_key", "TEXT", 0, 0))
         actual_columns = [
             (row["name"], row["type"].upper(), row["notnull"], row["pk"])
@@ -493,7 +550,7 @@ class SQLiteStore:
               AND name NOT LIKE 'sqlite_%'
             """
         ).fetchall()
-        if expected_version == SCHEMA_VERSION:
+        if expected_version in (_V3_SCHEMA_VERSION, SCHEMA_VERSION):
             if len(indexes) != 1 or indexes[0]["name"] != _IDEMPOTENCY_INDEX:
                 raise StorageError("Database idempotency index is invalid.")
             if self._normalize_sql(indexes[0]["sql"]) != self._normalize_sql(
@@ -503,7 +560,11 @@ class SQLiteStore:
         elif indexes:
             raise StorageError("Unexpected indexes exist on system_events.")
 
-        if expected_version in (_V2_SCHEMA_VERSION, SCHEMA_VERSION):
+        if expected_version in (
+            _V2_SCHEMA_VERSION,
+            _V3_SCHEMA_VERSION,
+            SCHEMA_VERSION,
+        ):
             self._verify_append_only_triggers()
 
         integrity = self._connection.execute(
@@ -527,6 +588,10 @@ class SQLiteStore:
             backup = sqlite3.connect(
                 str(backup_path), timeout=5.0, isolation_level=None
             )
+            backup_store = object.__new__(SQLiteStore)
+            backup_store._connection = backup
+            backup_store._configure_connection()
+            backup_store._configure_durability(allow_transition=True)
             self._connection.backup(backup)
             backup.close()
             backup = None
@@ -535,9 +600,10 @@ class SQLiteStore:
                 str(backup_path), timeout=5.0, isolation_level=None
             )
             try:
-                verify.row_factory = sqlite3.Row
                 verifier = object.__new__(SQLiteStore)
                 verifier._connection = verify
+                verifier._configure_connection()
+                verifier._configure_durability()
                 verifier._verify_schema(expected_version=version)
             finally:
                 verify.close()
@@ -555,13 +621,7 @@ class SQLiteStore:
     def _create_verified_v1_backup(self, database_path: Path) -> Path:
         return self._create_verified_backup(database_path, version=1)
 
-    def _migrate_v1_to_v3(self) -> None:
-        if not hasattr(self, "_database_path") or self._database_path is None:
-            raise StorageError(
-                "A durable backup is required before migrating this database."
-            )
-
-        backup_path = self._create_verified_v1_backup(self._database_path)
+    def _migrate_v1_to_v4(self, backup_path: Path) -> None:
         try:
             self._schema_transaction(self._connection)
             self._verify_schema(expected_version=1)
@@ -597,15 +657,7 @@ class SQLiteStore:
                 f"back and the verified backup was retained at {backup_path}."
             ) from exc
 
-    def _migrate_v2_to_v3(self) -> None:
-        if not hasattr(self, "_database_path") or self._database_path is None:
-            raise StorageError(
-                "A durable backup is required before migrating this database."
-            )
-
-        backup_path = self._create_verified_backup(
-            self._database_path, version=_V2_SCHEMA_VERSION
-        )
+    def _migrate_v2_to_v4(self, backup_path: Path) -> None:
         try:
             self._schema_transaction(self._connection)
             self._verify_schema(expected_version=_V2_SCHEMA_VERSION)
@@ -626,6 +678,21 @@ class SQLiteStore:
                 f"back and the verified backup was retained at {backup_path}."
             ) from exc
 
+    def _migrate_v3_to_v4(self, backup_path: Path) -> None:
+        try:
+            self._schema_transaction(self._connection)
+            self._verify_schema(expected_version=_V3_SCHEMA_VERSION)
+            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._verify_schema(expected_version=SCHEMA_VERSION)
+            self._connection.commit()
+        except Exception as exc:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise StorageError(
+                "Database storage-policy migration failed; the original schema "
+                f"was rolled back and the verified backup was retained at {backup_path}."
+            ) from exc
+
     def _initialize_schema(self) -> None:
         version = self._connection.execute(
             "PRAGMA user_version"
@@ -642,14 +709,28 @@ class SQLiteStore:
                 "Database has no initialized schema; initialize it explicitly."
             )
 
-        elif version == 1:
-            self._migrate_v1_to_v3()
-
-        elif version == _V2_SCHEMA_VERSION:
-            self._migrate_v2_to_v3()
-
-        else:
+        if version == SCHEMA_VERSION:
+            self._configure_durability()
             self._verify_schema(expected_version=SCHEMA_VERSION)
+            return
+
+        if version not in (1, _V2_SCHEMA_VERSION, _V3_SCHEMA_VERSION):
+            raise StorageError(f"Unsupported schema version {version}.")
+
+        if self._database_path is None:
+            raise StorageError("A durable backup is required before migration.")
+
+        # Validate and back up the old schema before changing persistent mode.
+        self._verify_schema(expected_version=version)
+        backup_path = self._create_verified_backup(self._database_path, version)
+        self._configure_durability(allow_transition=True)
+
+        if version == 1:
+            self._migrate_v1_to_v4(backup_path)
+        elif version == _V2_SCHEMA_VERSION:
+            self._migrate_v2_to_v4(backup_path)
+        else:
+            self._migrate_v3_to_v4(backup_path)
 
     def record_event(
         self,
