@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -96,6 +97,8 @@ _IDEMPOTENCY_KEY_RE = re.compile(
 _CONNECTION_OPEN = "OPEN"
 _CONNECTION_INVALID = "INVALID"
 _CONNECTION_CLOSED = "CLOSED"
+_BACKUP_MANIFEST_FORMAT_VERSION = 1
+_BACKUP_CHECKSUM_SCOPE = "finalized-main-database-after-wal-truncate-and-close"
 
 
 class StorageError(RuntimeError):
@@ -151,6 +154,7 @@ class SQLiteStore:
         self._state = _CONNECTION_OPEN
         self._connection_close_succeeded = False
         self._cleanup_errors: list[BaseException] = []
+        self._migration_reservation_active = False
 
         try:
             self._connection = self._connect_existing(path)
@@ -307,6 +311,7 @@ class SQLiteStore:
         store._state = _CONNECTION_OPEN
         store._connection_close_succeeded = False
         store._cleanup_errors = []
+        store._migration_reservation_active = False
         store._database_path = None
 
         if raw_path == ":memory:":
@@ -676,181 +681,580 @@ class SQLiteStore:
     def _schema_transaction(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
 
-    def _create_verified_backup(self, database_path: Path, version: int) -> Path:
-        """Create and validate a consistent, retained pre-migration backup."""
+    @staticmethod
+    def _backup_manifest_path(backup_path: Path) -> Path:
+        return backup_path.with_name(backup_path.name + ".manifest.json")
 
-        backup_path = database_path.with_name(
-            f"{database_path.name}.v{version}-backup-{uuid4().hex}.sqlite3"
-        )
-        backup = None
+    @staticmethod
+    def _assert_backup_sidecars(
+        backup_path: Path,
+        *,
+        allow_wal_header: bool = False,
+        inspect_shm: bool = True,
+    ) -> None:
+        """Reject WAL frames and SHM state outside the verifier's own handle."""
+
+        wal_path = Path(str(backup_path) + "-wal")
+        shm_path = Path(str(backup_path) + "-shm")
         try:
-            backup = sqlite3.connect(
-                str(backup_path), timeout=5.0, isolation_level=None
-            )
-            backup_store = object.__new__(SQLiteStore)
-            backup_store._connection = backup
-            backup_store._configure_connection()
-            backup_store._configure_durability(allow_transition=True)
-            self._connection.backup(backup)
-            backup.close()
-            backup = None
+            if wal_path.exists():
+                wal_size = wal_path.stat().st_size
+                maximum_empty_size = 32 if allow_wal_header else 0
+                if wal_size > maximum_empty_size:
+                    raise StorageError(
+                        "Backup has unexpected WAL sidecar content."
+                    )
+            if inspect_shm and shm_path.exists():
+                raise StorageError(
+                    "Backup has an unexpected SHM sidecar; another or stale "
+                    "SQLite handle may exist."
+                )
+        except OSError as exc:
+            raise StorageError("Could not inspect backup SQLite sidecars.") from exc
 
-            verify = sqlite3.connect(
-                str(backup_path), timeout=5.0, isolation_level=None
+    @staticmethod
+    def _write_manifest_file(path: Path, content: bytes, *, exclusive: bool) -> None:
+        if exclusive:
+            descriptor = os.open(
+                path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
             )
+            with os.fdopen(descriptor, "wb") as manifest_file:
+                manifest_file.write(content)
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+            return
+
+        temporary_path = path.with_name(path.name + f".tmp-{uuid4().hex}")
+        descriptor = os.open(
+            temporary_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        with os.fdopen(descriptor, "wb") as manifest_file:
+            manifest_file.write(content)
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        os.replace(temporary_path, path)
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
-                verifier = object.__new__(SQLiteStore)
-                verifier._connection = verify
-                verifier._configure_connection()
-                verifier._configure_durability()
-                verifier._verify_schema(expected_version=version)
+                os.fsync(directory_fd)
             finally:
-                verify.close()
+                os.close(directory_fd)
+
+    @classmethod
+    def _publish_backup_manifest(cls, path: Path, manifest: dict[str, Any], *, exclusive: bool = False) -> None:
+        serialized = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        cls._write_manifest_file(path, serialized, exclusive=exclusive)
+
+    @classmethod
+    def _verify_backup_manifest(cls, backup_path: str | Path) -> dict[str, Any]:
+        """Validate the unsigned completion manifest and finalized-file digest."""
+
+        path = Path(backup_path)
+        manifest_path = cls._backup_manifest_path(path)
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StorageError("Backup manifest is missing or malformed.") from exc
+        required = {
+            "manifest_format_version",
+            "status",
+            "backup_id",
+            "migration_attempt_id",
+            "source_path",
+            "source_schema_version",
+            "snapshot_utc",
+            "event_count",
+            "highest_event_id",
+            "sqlite_sequence",
+            "journal_mode",
+            "synchronous",
+            "verification_utc",
+            "sha256",
+            "checksum_scope",
+        }
+        if (
+            not isinstance(manifest, dict)
+            or not required.issubset(manifest)
+            or manifest.get("manifest_format_version")
+            != _BACKUP_MANIFEST_FORMAT_VERSION
+            or manifest.get("status") != "VERIFIED"
+            or manifest.get("checksum_scope") != _BACKUP_CHECKSUM_SCOPE
+            or manifest.get("journal_mode") != "wal"
+            or manifest.get("synchronous") != "FULL"
+            or not isinstance(manifest.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"]) is None
+        ):
+            raise StorageError("Backup manifest is incomplete or invalid.")
+        try:
+            backup_id = str(manifest["backup_id"])
+            migration_id = str(manifest["migration_attempt_id"])
+            if (
+                str(UUID(backup_id)) != backup_id
+                or backup_id != migration_id
+                or not Path(manifest["source_path"]).is_absolute()
+                or isinstance(manifest["source_schema_version"], bool)
+                or not isinstance(manifest["source_schema_version"], int)
+                or manifest["source_schema_version"] not in (1, 2, 3, 4)
+                or isinstance(manifest["event_count"], bool)
+                or not isinstance(manifest["event_count"], int)
+                or manifest["event_count"] < 0
+                or (manifest["event_count"] == 0) != (manifest["highest_event_id"] is None)
+                or (
+                    manifest["highest_event_id"] is not None
+                    and (
+                        isinstance(manifest["highest_event_id"], bool)
+                        or not isinstance(manifest["highest_event_id"], int)
+                        or manifest["highest_event_id"] < 1
+                    )
+                )
+                or (
+                    manifest["sqlite_sequence"] is not None
+                    and (
+                        isinstance(manifest["sqlite_sequence"], bool)
+                        or not isinstance(manifest["sqlite_sequence"], int)
+                        or manifest["sqlite_sequence"] < 0
+                    )
+                )
+                or (
+                    manifest["sqlite_sequence"] is not None
+                    and manifest["highest_event_id"] is not None
+                    and manifest["sqlite_sequence"] < manifest["highest_event_id"]
+                )
+                or not isinstance(manifest["snapshot_utc"], str)
+                or not isinstance(manifest["verification_utc"], str)
+                or not manifest["snapshot_utc"].endswith("Z")
+                or not manifest["verification_utc"].endswith("Z")
+            ):
+                raise ValueError("invalid manifest field")
+            datetime.fromisoformat(manifest["snapshot_utc"].replace("Z", "+00:00"))
+            datetime.fromisoformat(manifest["verification_utc"].replace("Z", "+00:00"))
+        except (TypeError, ValueError, OSError) as exc:
+            raise StorageError("Backup manifest contains invalid metadata.") from exc
+        connection = None
+        try:
+            cls._assert_backup_sidecars(path)
+            connection = cls._connect_existing(path)
+            verifier = object.__new__(cls)
+            verifier._connection = connection
+            verifier._configure_connection()
+            verifier._configure_durability()
+            connection.execute("BEGIN IMMEDIATE")
+            if not connection.in_transaction:
+                raise StorageError(
+                    "Could not reserve the backup while verifying its checksum."
+                )
+            cls._assert_backup_sidecars(
+                path, allow_wal_header=True, inspect_shm=False
+            )
+            verifier._verify_file_durability()
+            digest = cls._sha256_file(path)
+            connection.rollback()
+            if connection.in_transaction:
+                raise StorageError(
+                    "Backup checksum verification did not release its transaction."
+                )
+            connection.close()
+            connection = None
+            cls._assert_backup_sidecars(path)
         except BaseException as exc:
-            if backup is not None:
+            if connection is not None:
                 try:
-                    backup.close()
+                    if connection.in_transaction:
+                        connection.rollback()
+                    connection.close()
                 except BaseException as close_error:
-                    self._cleanup_errors.append(close_error)
                     exc.add_note(
-                        "Backup connection cleanup also failed: "
+                        "Backup manifest verification cleanup failed: "
                         f"{type(close_error).__name__}: {close_error}"
                     )
             if not isinstance(exc, Exception):
                 raise
-            # Keep any incomplete artifact for diagnosis; it is never treated
-            # as a verified backup. SQLite backup is consistent, but this
-            # local backup is not protected from a privileged local attacker.
+            if isinstance(exc, StorageError):
+                raise
+            raise StorageError(
+                "Could not safely verify the backup artifact and sidecars."
+            ) from exc
+        if digest != manifest["sha256"]:
+            raise StorageError("Backup checksum does not match its manifest.")
+        return manifest
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as artifact:
+            for block in iter(lambda: artifact.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _backup_watermark(connection: sqlite3.Connection, version: int) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT COUNT(*), MAX(event_id) FROM system_events"
+        ).fetchone()
+        sequence = None
+        has_sequence = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+        ).fetchone()
+        if has_sequence:
+            sequence_row = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'system_events'"
+            ).fetchone()
+            sequence = int(sequence_row[0]) if sequence_row else None
+        return {
+            "source_schema_version": version,
+            "event_count": int(row[0]),
+            "highest_event_id": int(row[1]) if row[1] is not None else None,
+            "sqlite_sequence": sequence,
+        }
+
+    @staticmethod
+    def _compare_backup_rows(
+        source: sqlite3.Connection,
+        backup: sqlite3.Connection,
+        version: int,
+        batch_size: int = 256,
+    ) -> None:
+        columns = ["event_id", "event_type", "occurred_at_utc", "payload_json"]
+        if version in (_V3_SCHEMA_VERSION, SCHEMA_VERSION):
+            columns.append("idempotency_key")
+        selection = ", ".join(columns)
+        source_cursor = source.execute(
+            f"SELECT {selection} FROM system_events ORDER BY event_id"
+        )
+        backup_cursor = backup.execute(
+            f"SELECT {selection} FROM system_events ORDER BY event_id"
+        )
+        while True:
+            source_rows = source_cursor.fetchmany(batch_size)
+            backup_rows = backup_cursor.fetchmany(batch_size)
+            if [tuple(row) for row in source_rows] != [
+                tuple(row) for row in backup_rows
+            ]:
+                raise StorageError("Backup event rows differ from the source snapshot.")
+            if not source_rows:
+                break
+
+    @staticmethod
+    def _run_online_backup(
+        source: sqlite3.Connection, destination: sqlite3.Connection
+    ) -> None:
+        source.backup(destination)
+
+    def _create_verified_backup(self, database_path: Path, version: int) -> Path:
+        """Create a migration backup while holding the caller's write reservation."""
+
+        self._ensure_open()
+        self._require_migration_transaction()
+        if self._database_path is None:
+            raise StorageError("A file-backed store is required for migration backup.")
+        try:
+            source_path = Path(database_path).resolve(strict=True)
+            owned_path = self._database_path.resolve(strict=True)
+        except OSError as exc:
+            raise StorageError("Could not resolve the migration source path.") from exc
+        if source_path != owned_path:
+            raise StorageError(
+                "Migration backup source does not match the database reserved by this store."
+            )
+
+        attempt_id = str(uuid4())
+        backup_path = database_path.with_name(
+            f"{database_path.name}.v{version}-backup-{attempt_id.replace('-', '')}.sqlite3"
+        )
+        manifest_path = self._backup_manifest_path(backup_path)
+        backup = None
+        source = None
+        verify = None
+        manifest: dict[str, Any] | None = None
+        owns_manifest = False
+        try:
+            source = self._connect_existing(source_path)
+            source_store = object.__new__(SQLiteStore)
+            source_store._connection = source
+            source_store._configure_connection()
+            source_store._configure_durability()
+            source_store._verify_schema(expected_version=version)
+            watermark = self._backup_watermark(source, version)
+            watermark.update(
+                {
+                    "manifest_format_version": _BACKUP_MANIFEST_FORMAT_VERSION,
+                    "status": "INCOMPLETE",
+                    "backup_id": attempt_id,
+                    "migration_attempt_id": attempt_id,
+                    "source_path": str(source_path),
+                    "snapshot_utc": datetime.now(timezone.utc)
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z"),
+                    "journal_mode": "wal",
+                    "synchronous": "FULL",
+                    "verification_utc": None,
+                    "sha256": None,
+                    "checksum_scope": _BACKUP_CHECKSUM_SCOPE,
+                }
+            )
+            manifest = watermark
+            descriptor = os.open(
+                backup_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+            )
+            os.close(descriptor)
+            self._publish_backup_manifest(manifest_path, manifest, exclusive=True)
+            owns_manifest = True
+            backup = self._connect_existing(backup_path)
+            destination_store = object.__new__(SQLiteStore)
+            destination_store._connection = backup
+            destination_store._configure_connection()
+            destination_store._configure_durability(allow_transition=True)
+            self._run_online_backup(source, backup)
+            backup.close()
+            backup = None
+
+            verify = self._connect_existing(backup_path)
+            verifier = object.__new__(SQLiteStore)
+            verifier._connection = verify
+            verifier._configure_connection()
+            verifier._configure_durability()
+            verifier._verify_schema(expected_version=version)
+            backup_watermark = self._backup_watermark(verify, version)
+            for field in (
+                "source_schema_version",
+                "event_count",
+                "highest_event_id",
+                "sqlite_sequence",
+            ):
+                if backup_watermark[field] != watermark[field]:
+                    raise StorageError(f"Backup watermark mismatch for {field}.")
+            self._compare_backup_rows(source, verify, version)
+
+            checkpoint = verify.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if (
+                checkpoint is None
+                or checkpoint[0] != 0
+                or (
+                    checkpoint[1] >= 0
+                    and checkpoint[2] != checkpoint[1]
+                )
+            ):
+                raise StorageError("Backup WAL checkpoint did not fully complete.")
+            verifier._verify_schema(expected_version=version)
+            verify.close()
+            verify = None
+            source.close()
+            source = None
+
+            self._assert_backup_sidecars(backup_path)
+            manifest["status"] = "VERIFIED"
+            manifest["verification_utc"] = (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
+            manifest["sha256"] = self._sha256_file(backup_path)
+            self._publish_backup_manifest(manifest_path, manifest)
+            # Reopen under a writer reservation so a replacement during
+            # manifest publication is detected before returning the artifact.
+            self._verify_backup_manifest(backup_path)
+            return backup_path
+        except BaseException as exc:
+            for connection in (verify, backup, source):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except BaseException as close_error:
+                        self._cleanup_errors.append(close_error)
+                        exc.add_note(
+                            "Backup connection cleanup also failed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+            if owns_manifest and manifest is not None and isinstance(exc, Exception):
+                manifest["status"] = "REJECTED"
+                manifest["verification_utc"] = (
+                    datetime.now(timezone.utc)
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z")
+                )
+                manifest["sha256"] = None
+                try:
+                    self._publish_backup_manifest(manifest_path, manifest)
+                except BaseException as manifest_error:
+                    self._cleanup_errors.append(manifest_error)
+                    exc.add_note(
+                        "Could not publish REJECTED backup manifest: "
+                        f"{type(manifest_error).__name__}: {manifest_error}"
+                    )
+            if not isinstance(exc, Exception):
+                raise
             raise StorageError(
                 f"Could not create and verify migration backup: {backup_path}"
             ) from exc
-        return backup_path
 
     def _create_verified_v1_backup(self, database_path: Path) -> Path:
         return self._create_verified_backup(database_path, version=1)
 
-    def _migrate_v1_to_v4(self, backup_path: Path) -> None:
+    def _require_migration_transaction(self) -> None:
         try:
-            self._schema_transaction(self._connection)
-            self._verify_schema(expected_version=1)
-            self._connection.execute(
-                "ALTER TABLE system_events RENAME TO system_events_v1_migration"
-            )
-            self._connection.execute(_V2_TABLE_SQL)
-            self._connection.execute(
-                """
-                INSERT INTO system_events (
-                    event_id, event_type, occurred_at_utc, payload_json
-                )
-                SELECT event_id, event_type, occurred_at_utc, payload_json
-                FROM system_events_v1_migration
-                """
-            )
-            self._connection.execute("DROP TABLE system_events_v1_migration")
-            self._install_append_only_triggers()
-            self._connection.execute(
-                "ALTER TABLE system_events ADD COLUMN idempotency_key TEXT"
-            )
-            self._install_idempotency_protection()
-            self._connection.execute(
-                f"PRAGMA user_version = {SCHEMA_VERSION}"
-            )
-            self._verify_schema(expected_version=SCHEMA_VERSION)
-            self._connection.commit()
+            active = self._connection.in_transaction
         except BaseException as exc:
-            cleanup_errors = self._rollback_for_error()
-            self._invalidate_connection(exc, cleanup_errors)
-            if not isinstance(exc, Exception):
-                raise
-            error = self._raise_with_cleanup_failure(
-                "Database migration failed; the verified backup was retained "
-                f"at {backup_path}.",
-                cleanup_errors,
+            raise StorageError("Could not verify the migration transaction.") from exc
+        if not active or not self._migration_reservation_active:
+            raise StorageError("Migration requires an active write transaction.")
+
+    def _migrate_v1_to_v4(self, backup_path: Path) -> None:
+        self._require_migration_transaction()
+        self._verify_schema(expected_version=1)
+        sequence_row = self._connection.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'system_events'"
+        ).fetchone()
+        prior_sequence = int(sequence_row[0]) if sequence_row else None
+        self._connection.execute(
+            "ALTER TABLE system_events RENAME TO system_events_v1_migration"
+        )
+        self._connection.execute(_V2_TABLE_SQL)
+        self._connection.execute(
+            """
+            INSERT INTO system_events (
+                event_id, event_type, occurred_at_utc, payload_json
             )
-            raise error from exc
+            SELECT event_id, event_type, occurred_at_utc, payload_json
+            FROM system_events_v1_migration
+            """
+        )
+        self._connection.execute("DROP TABLE system_events_v1_migration")
+        if prior_sequence is not None:
+            sequence_update = self._connection.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'system_events'",
+                (prior_sequence,),
+            )
+            if sequence_update.rowcount == 0:
+                self._connection.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                    ("system_events", prior_sequence),
+                )
+        self._install_append_only_triggers()
+        self._connection.execute(
+            "ALTER TABLE system_events ADD COLUMN idempotency_key TEXT"
+        )
+        self._install_idempotency_protection()
+        self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_v2_to_v4(self, backup_path: Path) -> None:
-        try:
-            self._schema_transaction(self._connection)
-            self._verify_schema(expected_version=_V2_SCHEMA_VERSION)
-            self._connection.execute(
-                "ALTER TABLE system_events ADD COLUMN idempotency_key TEXT"
-            )
-            self._install_idempotency_protection()
-            self._connection.execute(
-                f"PRAGMA user_version = {SCHEMA_VERSION}"
-            )
-            self._verify_schema(expected_version=SCHEMA_VERSION)
-            self._connection.commit()
-        except BaseException as exc:
-            cleanup_errors = self._rollback_for_error()
-            self._invalidate_connection(exc, cleanup_errors)
-            if not isinstance(exc, Exception):
-                raise
-            error = self._raise_with_cleanup_failure(
-                "Database migration failed; the verified backup was retained "
-                f"at {backup_path}.",
-                cleanup_errors,
-            )
-            raise error from exc
+        self._require_migration_transaction()
+        self._verify_schema(expected_version=_V2_SCHEMA_VERSION)
+        self._connection.execute(
+            "ALTER TABLE system_events ADD COLUMN idempotency_key TEXT"
+        )
+        self._install_idempotency_protection()
+        self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _migrate_v3_to_v4(self, backup_path: Path) -> None:
-        try:
-            self._schema_transaction(self._connection)
-            self._verify_schema(expected_version=_V3_SCHEMA_VERSION)
-            self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            self._verify_schema(expected_version=SCHEMA_VERSION)
-            self._connection.commit()
-        except BaseException as exc:
-            cleanup_errors = self._rollback_for_error()
-            self._invalidate_connection(exc, cleanup_errors)
-            if not isinstance(exc, Exception):
-                raise
-            error = self._raise_with_cleanup_failure(
-                "Database storage-policy migration failed; the verified backup "
-                f"was retained at {backup_path}.",
-                cleanup_errors,
-            )
-            raise error from exc
+        self._require_migration_transaction()
+        self._verify_schema(expected_version=_V3_SCHEMA_VERSION)
+        self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _initialize_schema(self) -> None:
-        version = self._connection.execute(
+        preliminary_version = self._connection.execute(
             "PRAGMA user_version"
         ).fetchone()[0]
 
-        if version > SCHEMA_VERSION:
+        if preliminary_version > SCHEMA_VERSION:
             raise StorageError(
-                f"Database schema version {version} is newer "
+                f"Database schema version {preliminary_version} is newer "
                 f"than supported version {SCHEMA_VERSION}."
             )
 
-        if version == 0:
+        if preliminary_version == 0:
             raise StorageError(
                 "Database has no initialized schema; initialize it explicitly."
             )
 
-        if version == SCHEMA_VERSION:
+        if preliminary_version == SCHEMA_VERSION:
             self._configure_durability()
             self._verify_schema(expected_version=SCHEMA_VERSION)
             return
 
-        if version not in (1, _V2_SCHEMA_VERSION, _V3_SCHEMA_VERSION):
-            raise StorageError(f"Unsupported schema version {version}.")
+        if preliminary_version not in (1, _V2_SCHEMA_VERSION, _V3_SCHEMA_VERSION):
+            raise StorageError(f"Unsupported schema version {preliminary_version}.")
 
         if self._database_path is None:
             raise StorageError("A durable backup is required before migration.")
 
-        # Validate and back up the old schema before changing persistent mode.
-        self._verify_schema(expected_version=version)
-        backup_path = self._create_verified_backup(self._database_path, version)
+        # Reject malformed legacy databases before changing their journal mode.
+        # A competing migration may commit between the version read and this
+        # verification. In that case, defer authoritative validation until the
+        # write reservation is acquired and the version is reread.
+        try:
+            self._verify_schema(expected_version=preliminary_version)
+        except StorageError:
+            observed_version = int(
+                self._connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if observed_version == preliminary_version or observed_version not in (
+                1,
+                _V2_SCHEMA_VERSION,
+                _V3_SCHEMA_VERSION,
+                SCHEMA_VERSION,
+            ):
+                raise
+            preliminary_version = observed_version
         self._configure_durability(allow_transition=True)
 
-        if version == 1:
-            self._migrate_v1_to_v4(backup_path)
-        elif version == _V2_SCHEMA_VERSION:
-            self._migrate_v2_to_v4(backup_path)
-        else:
-            self._migrate_v3_to_v4(backup_path)
+        backup_path: Path | None = None
+        phase = "BEGIN"
+        try:
+            self._schema_transaction(self._connection)
+            self._migration_reservation_active = True
+            phase = "LOCKED"
+            self._require_migration_transaction()
+            version = int(
+                self._connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if version == SCHEMA_VERSION:
+                self._verify_file_durability()
+                self._verify_schema(expected_version=SCHEMA_VERSION)
+                phase = "COMMIT"
+                self._connection.commit()
+                self._migration_reservation_active = False
+                return
+            if version not in (1, _V2_SCHEMA_VERSION, _V3_SCHEMA_VERSION):
+                raise StorageError(
+                    f"Unsupported schema version {version} after reservation."
+                )
+
+            self._verify_schema(expected_version=version)
+            backup_path = self._create_verified_backup(self._database_path, version)
+            self._require_migration_transaction()
+            if version == 1:
+                self._migrate_v1_to_v4(backup_path)
+            elif version == _V2_SCHEMA_VERSION:
+                self._migrate_v2_to_v4(backup_path)
+            else:
+                self._migrate_v3_to_v4(backup_path)
+            self._verify_schema(expected_version=SCHEMA_VERSION)
+            phase = "COMMIT"
+            self._connection.commit()
+            self._migration_reservation_active = False
+        except BaseException as exc:
+            cleanup_errors = self._rollback_for_error()
+            self._migration_reservation_active = False
+            if cleanup_errors or phase == "COMMIT":
+                self._invalidate_connection(exc, cleanup_errors)
+            if not isinstance(exc, Exception):
+                raise
+            if phase == "COMMIT":
+                message = (
+                    "Migration COMMIT outcome is uncertain; the storage connection "
+                    "was invalidated. Reopen and independently verify the database "
+                    "before further use."
+                )
+            else:
+                message = "Database migration failed; the source transaction was rolled back."
+            if backup_path is not None:
+                message += f" The verified backup was retained at {backup_path}."
+            error = self._raise_with_cleanup_failure(message, cleanup_errors)
+            raise error from exc
 
     def record_event(
         self,

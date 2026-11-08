@@ -4,7 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import textwrap
-from threading import Barrier
+import time
+from threading import Barrier, Event
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -528,18 +529,35 @@ class StorageTests(unittest.TestCase):
             database = Path(directory) / "origin.sqlite3"
             with SQLiteStore.initialize(database) as store:
                 _record(store, "initial_event")
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
                 start_writes = Barrier(2)
+                writer_attempting = Event()
 
                 def write_events():
                     with SQLiteStore(database) as writer:
                         start_writes.wait()
+                        writer_attempting.set()
                         for index in range(100):
                             _record(writer, "concurrent_event", {"index": index})
 
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     writer = pool.submit(write_events)
                     start_writes.wait()
+                    self.assertTrue(writer_attempting.wait(10))
+                    self.assertFalse(writer.done())
                     backup_path = store._create_verified_backup(database, version=4)
+                    backup = sqlite3.connect(backup_path)
+                    try:
+                        self.assertEqual(
+                            backup.execute(
+                                "SELECT COUNT(*) FROM system_events"
+                            ).fetchone()[0],
+                            1,
+                        )
+                    finally:
+                        backup.close()
+                    store._connection.commit()
                     writer.result(timeout=20)
 
                 backup = sqlite3.connect(backup_path)
@@ -553,17 +571,701 @@ class StorageTests(unittest.TestCase):
                 finally:
                     backup.close()
 
+    def test_verified_manifest_records_watermark_and_detects_file_change(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "manifest_event", {"n": 1})
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                original = SQLiteStore._run_online_backup
+                observed = []
+
+                def inspect_connections(source, destination):
+                    actual = []
+                    for connection in (source, destination):
+                        actual.append(
+                            (
+                                connection.execute("PRAGMA journal_mode").fetchone()[0],
+                                connection.execute("PRAGMA synchronous").fetchone()[0],
+                                connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0],
+                                connection.execute("PRAGMA busy_timeout").fetchone()[0],
+                                connection.execute("PRAGMA foreign_keys").fetchone()[0],
+                                connection.execute("PRAGMA recursive_triggers").fetchone()[0],
+                            )
+                        )
+                    observed.extend(actual)
+                    original(source, destination)
+
+                with patch.object(
+                    SQLiteStore,
+                    "_run_online_backup",
+                    staticmethod(inspect_connections),
+                ):
+                    backup_path = store._create_verified_backup(database, version=4)
+                self.assertEqual(observed, [("wal", 2, 1000, 5000, 1, 1)] * 2)
+                manifest = SQLiteStore._verify_backup_manifest(backup_path)
+                self.assertEqual(manifest["status"], "VERIFIED")
+                self.assertEqual(manifest["source_schema_version"], 4)
+                self.assertEqual(manifest["event_count"], 1)
+                self.assertEqual(manifest["highest_event_id"], 1)
+                self.assertEqual(manifest["sqlite_sequence"], 1)
+                self.assertEqual(manifest["journal_mode"], "wal")
+                self.assertEqual(manifest["synchronous"], "FULL")
+                self.assertEqual(
+                    manifest["checksum_scope"],
+                    "finalized-main-database-after-wal-truncate-and-close",
+                )
+                wal_path = Path(str(backup_path) + "-wal")
+                self.assertTrue(
+                    not wal_path.exists() or wal_path.stat().st_size == 0
+                )
+                store._connection.rollback()
+
+            with backup_path.open("ab") as artifact:
+                artifact.write(b"tamper")
+            with self.assertRaisesRegex(StorageError, "checksum"):
+                SQLiteStore._verify_backup_manifest(backup_path)
+
+    def test_verified_manifest_rejects_committed_wal_content_after_verification(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                backup_path = store._create_verified_backup(database, version=4)
+                store._connection.rollback()
+
+            reader = sqlite3.connect(backup_path, isolation_level=None)
+            writer = None
+            try:
+                reader.execute("BEGIN")
+                reader.execute("SELECT COUNT(*) FROM system_events").fetchone()
+                writer = sqlite3.connect(backup_path, isolation_level=None)
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute(
+                    """INSERT INTO system_events
+                       (event_type, occurred_at_utc, payload_json, idempotency_key)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        "post_verification_write",
+                        "2026-01-01T00:00:00Z",
+                        "{}",
+                        "test:00000000-0000-0000-0000-000000000099",
+                    ),
+                )
+                writer.commit()
+                writer.close()
+                writer = None
+                wal_path = Path(str(backup_path) + "-wal")
+                self.assertTrue(wal_path.exists())
+                self.assertGreater(wal_path.stat().st_size, 32)
+                with self.assertRaisesRegex(StorageError, "WAL sidecar"):
+                    SQLiteStore._verify_backup_manifest(backup_path)
+            finally:
+                if writer is not None:
+                    writer.close()
+                if reader.in_transaction:
+                    reader.execute("ROLLBACK")
+                reader.close()
+
+    def test_backup_manifest_rejects_unexpected_wal_and_shm_sidecars(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                backup_path = store._create_verified_backup(database, version=4)
+                store._connection.rollback()
+
+            wal_path = Path(str(backup_path) + "-wal")
+            shm_path = Path(str(backup_path) + "-shm")
+            wal_path.write_bytes(b"unexpected WAL content")
+            with self.assertRaisesRegex(StorageError, "WAL sidecar"):
+                SQLiteStore._verify_backup_manifest(backup_path)
+            wal_path.unlink()
+
+            shm_path.write_bytes(b"")
+            with self.assertRaisesRegex(StorageError, "SHM sidecar"):
+                SQLiteStore._verify_backup_manifest(backup_path)
+            shm_path.unlink()
+
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backup_path)["status"],
+                "VERIFIED",
+            )
+
+    def test_backup_artifact_replacement_before_manifest_publication_is_detected(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                original = SQLiteStore._publish_backup_manifest
+                replaced = False
+
+                def replace_before_verified(cls, path, manifest, *, exclusive=False):
+                    nonlocal replaced
+                    if manifest.get("status") == "VERIFIED" and not replaced:
+                        artifact = next(
+                            Path(directory).glob("origin.sqlite3.v4-backup-*.sqlite3")
+                        )
+                        replacement = artifact.with_name(artifact.name + ".replacement")
+                        replacement.write_bytes(artifact.read_bytes())
+                        changed = sqlite3.connect(replacement)
+                        try:
+                            changed.execute("PRAGMA application_id=12345")
+                        finally:
+                            changed.close()
+                        replacement.replace(artifact)
+                        replaced = True
+                    return original(path, manifest, exclusive=exclusive)
+
+                with patch.object(
+                    SQLiteStore,
+                    "_publish_backup_manifest",
+                    classmethod(replace_before_verified),
+                ):
+                    with self.assertRaises(StorageError) as caught:
+                        store._create_verified_backup(database, version=4)
+                self.assertRegex(str(caught.exception.__cause__), "checksum")
+                backup_path = next(
+                    path for path in Path(directory).glob("*.sqlite3")
+                    if path != database
+                )
+                manifest = json.loads(
+                    SQLiteStore._backup_manifest_path(backup_path).read_text()
+                )
+                self.assertEqual(manifest["status"], "REJECTED")
+                store._connection.rollback()
+
+    def test_backup_source_must_match_store_migration_reservation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "owned.sqlite3"
+            other_database = root / "other.sqlite3"
+            with SQLiteStore.initialize(database) as store, SQLiteStore.initialize(
+                other_database
+            ):
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                with self.assertRaisesRegex(StorageError, "does not match"):
+                    store._create_verified_backup(other_database, version=4)
+                self.assertEqual(
+                    list(root.glob("other.sqlite3.v4-backup-*.sqlite3")), []
+                )
+                self.assertEqual(
+                    list(root.glob("other.sqlite3.v4-backup-*.manifest.json")), []
+                )
+                store._connection.rollback()
+
+    def test_backup_manifest_rejects_missing_incomplete_and_malformed_states(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                backup_path = store._create_verified_backup(database, version=4)
+                manifest_path = SQLiteStore._backup_manifest_path(backup_path)
+                original = manifest_path.read_text(encoding="utf-8")
+                for value in (
+                    "{\"manifest_format_version\":1,\"status\":\"INCOMPLETE\"}",
+                    "{invalid json",
+                ):
+                    with self.subTest(value=value):
+                        manifest_path.write_text(value, encoding="utf-8")
+                        with self.assertRaises(StorageError):
+                            SQLiteStore._verify_backup_manifest(backup_path)
+                invalid = json.loads(original)
+                invalid["manifest_format_version"] = 999
+                manifest_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(StorageError):
+                    SQLiteStore._verify_backup_manifest(backup_path)
+                manifest_path.unlink()
+                with self.assertRaises(StorageError):
+                    SQLiteStore._verify_backup_manifest(backup_path)
+                manifest_path.write_text(original, encoding="utf-8")
+                store._connection.rollback()
+
+    def test_backup_failure_keeps_rejected_artifact_and_never_verifies_it(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                original = SQLiteStore._run_online_backup
+                observed = {}
+
+                def fail_after_incomplete(source, destination):
+                    manifests = list(Path(directory).glob("*.manifest.json"))
+                    self.assertEqual(len(manifests), 1)
+                    observed.update(json.loads(manifests[0].read_text()))
+                    raise sqlite3.OperationalError("injected backup failure")
+
+                with patch.object(
+                    SQLiteStore,
+                    "_run_online_backup",
+                    staticmethod(fail_after_incomplete),
+                ):
+                    with self.assertRaises(StorageError):
+                        store._create_verified_backup(database, version=4)
+                self.assertEqual(observed["status"], "INCOMPLETE")
+                artifacts = list(Path(directory).glob("*.sqlite3"))
+                self.assertEqual(len(artifacts), 2)
+                backup_path = next(path for path in artifacts if path != database)
+                manifest = json.loads(
+                    SQLiteStore._backup_manifest_path(backup_path).read_text()
+                )
+                self.assertEqual(manifest["status"], "REJECTED")
+                with self.assertRaises(StorageError):
+                    SQLiteStore._verify_backup_manifest(backup_path)
+                store._connection.rollback()
+
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                with patch.object(
+                    SQLiteStore,
+                    "_compare_backup_rows",
+                    side_effect=StorageError("injected exact-row mismatch"),
+                ):
+                    with self.assertRaises(StorageError):
+                        store._create_verified_backup(database, version=4)
+                rejected = [
+                    path
+                    for path in Path(directory).glob("*.sqlite3")
+                    if path != database
+                    and json.loads(
+                        SQLiteStore._backup_manifest_path(path).read_text()
+                    )["status"]
+                    == "REJECTED"
+                ]
+                self.assertEqual(len(rejected), 2)
+                store._connection.rollback()
+
+    def test_exact_backup_row_comparison_detects_all_row_differences(self):
+        columns = """CREATE TABLE system_events (
+            event_id INTEGER PRIMARY KEY,
+            event_type TEXT,
+            occurred_at_utc TEXT,
+            payload_json TEXT,
+            idempotency_key TEXT
+        )"""
+        original = [
+            (2, "first", "2026-01-01T00:00:00Z", "{\"a\":1}", "test:00000000-0000-0000-0000-000000000001"),
+            (7, "second", "2026-01-02T00:00:00Z", "{\"b\":2}", "test:00000000-0000-0000-0000-000000000002"),
+        ]
+        variants = (
+            original[:-1],
+            original + [(9, "extra", "2026-01-03T00:00:00Z", "{}", "test:00000000-0000-0000-0000-000000000003")],
+            [original[0], (7, "changed", *original[1][2:])],
+            [(2, "first", "changed", *original[0][3:]), original[1]],
+            [(2, "first", original[0][2], "{\"a\":9}", original[0][4]), original[1]],
+            [(2, "first", *original[0][2:4], "test:00000000-0000-0000-0000-000000000009"), original[1]],
+            [(3, *original[0][1:]), original[1]],
+            [(7, *original[0][1:]), (2, *original[1][1:])],
+        )
+        for rows in variants:
+            with self.subTest(rows=rows), sqlite3.connect(":memory:") as source, sqlite3.connect(":memory:") as backup:
+                source.execute(columns)
+                backup.execute(columns)
+                source.executemany("INSERT INTO system_events VALUES (?, ?, ?, ?, ?)", original)
+                backup.executemany("INSERT INTO system_events VALUES (?, ?, ?, ?, ?)", rows)
+                with self.assertRaises(StorageError):
+                    SQLiteStore._compare_backup_rows(source, backup, version=3)
+
+        with sqlite3.connect(":memory:") as source, sqlite3.connect(":memory:") as backup:
+            source.execute(columns)
+            backup.execute(columns)
+            source.executemany("INSERT INTO system_events VALUES (?, ?, ?, ?, ?)", original)
+            backup.executemany("INSERT INTO system_events VALUES (?, ?, ?, ?, ?)", original)
+            SQLiteStore._compare_backup_rows(source, backup, version=3)
+
+    def test_verified_manifest_publication_failure_cannot_publish_verified_backup(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                original = SQLiteStore._publish_backup_manifest
+
+                def fail_verified(cls, path, manifest, *, exclusive=False):
+                    if manifest.get("status") == "VERIFIED":
+                        raise OSError("injected manifest publication failure")
+                    return original(path, manifest, exclusive=exclusive)
+
+                with patch.object(
+                    SQLiteStore,
+                    "_publish_backup_manifest",
+                    classmethod(fail_verified),
+                ):
+                    with self.assertRaises(StorageError):
+                        store._create_verified_backup(database, version=4)
+                backup = next(Path(directory).glob("origin.sqlite3.v4-backup-*.sqlite3"))
+                manifest = json.loads(
+                    SQLiteStore._backup_manifest_path(backup).read_text()
+                )
+                self.assertEqual(manifest["status"], "REJECTED")
+                with self.assertRaises(StorageError):
+                    SQLiteStore._verify_backup_manifest(backup)
+                store._connection.rollback()
+
+    def test_exact_backup_row_comparison_supports_v1_v2_and_event_id_gaps(self):
+        rows = [
+            (2, "first", "2026-01-01T00:00:00Z", "{}"),
+            (7, "second", "2026-01-02T00:00:00Z", "{\"x\":1}"),
+        ]
+        for version in (1, 2):
+            with self.subTest(version=version), sqlite3.connect(":memory:") as source, sqlite3.connect(":memory:") as backup:
+                for connection in (source, backup):
+                    connection.execute(
+                        """CREATE TABLE system_events (
+                           event_id INTEGER PRIMARY KEY, event_type TEXT,
+                           occurred_at_utc TEXT, payload_json TEXT)"""
+                    )
+                    connection.executemany(
+                        "INSERT INTO system_events VALUES (?, ?, ?, ?)", rows
+                    )
+                SQLiteStore._compare_backup_rows(source, backup, version=version)
+
+    def test_exclusive_backup_creation_never_overwrites_existing_artifact(self):
+        fixed = uuid4()
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                backup_path = database.with_name(
+                    f"{database.name}.v4-backup-{str(fixed).replace('-', '')}.sqlite3"
+                )
+                backup_path.write_bytes(b"pre-existing evidence")
+                with patch("origin_trader.storage.sqlite_store.uuid4", return_value=fixed):
+                    with self.assertRaises(StorageError):
+                        store._create_verified_backup(database, version=4)
+                self.assertEqual(backup_path.read_bytes(), b"pre-existing evidence")
+                self.assertFalse(
+                    SQLiteStore._backup_manifest_path(backup_path).exists()
+                )
+                store._connection.rollback()
+
+    def test_migration_lock_timeout_fails_without_creating_backup(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "legacy")
+                store._connection.execute("PRAGMA user_version=3")
+            blocker = sqlite3.connect(database, isolation_level=None)
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                with self.assertRaises(StorageError):
+                    SQLiteStore(database)
+                self.assertEqual(
+                    list(Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3")),
+                    [],
+                )
+            finally:
+                blocker.execute("ROLLBACK")
+                blocker.close()
+            with SQLiteStore(database) as migrated:
+                self.assertEqual(
+                    migrated._connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+
+    def test_writer_committing_in_wal_transition_window_is_in_backup(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "before_transition")
+                store._connection.execute("PRAGMA user_version=3")
+            setup = sqlite3.connect(database)
+            try:
+                setup.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                setup.close()
+
+            reservation_window = Event()
+            resume_migration = Event()
+            original_begin = SQLiteStore._schema_transaction
+
+            def pause_before_reservation(connection):
+                reservation_window.set()
+                if not resume_migration.wait(10):
+                    raise TimeoutError("migration reservation test timed out")
+                original_begin(connection)
+
+            def migrate_and_close():
+                with SQLiteStore(database) as migrated:
+                    return migrated.read_events()
+
+            with patch.object(
+                SQLiteStore,
+                "_schema_transaction",
+                staticmethod(pause_before_reservation),
+            ), ThreadPoolExecutor(max_workers=1) as pool:
+                migration = pool.submit(migrate_and_close)
+                self.assertTrue(reservation_window.wait(10))
+                writer = sqlite3.connect(database, isolation_level=None, timeout=5)
+                try:
+                    writer.execute("PRAGMA busy_timeout=5000")
+                    writer.execute(
+                        """INSERT INTO system_events
+                           (event_type, occurred_at_utc, payload_json, idempotency_key)
+                           VALUES (?, ?, ?, ?)""",
+                        (
+                            "window_event",
+                            "2026-02-01T00:00:00Z",
+                            "{}",
+                            "test:00000000-0000-0000-0000-000000000099",
+                        ),
+                    )
+                finally:
+                    writer.close()
+                resume_migration.set()
+                self.assertEqual(
+                    [event.event_type for event in migration.result(timeout=20)],
+                    ["before_transition", "window_event"],
+                )
+
+            backups = list(Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(backups[0])
+            try:
+                rows = backup.execute(
+                    "SELECT event_type FROM system_events ORDER BY event_id"
+                ).fetchall()
+                self.assertEqual([row[0] for row in rows], ["before_transition", "window_event"])
+            finally:
+                backup.close()
+            manifest = SQLiteStore._verify_backup_manifest(backups[0])
+            self.assertEqual(manifest["event_count"], 2)
+
+    def test_two_migration_processes_create_one_verified_backup(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            ready_dir = Path(directory) / "start-barrier"
+            ready_dir.mkdir()
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "legacy")
+                store._connection.execute("PRAGMA user_version=3")
+            script = textwrap.dedent(
+                """
+                import json, pathlib, sys, time
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                ready_dir = pathlib.Path(sys.argv[3])
+                label = sys.argv[4]
+                (ready_dir / (label + '.ready')).write_text('ready')
+                deadline = time.monotonic() + 15
+                while not (ready_dir / 'go').exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('migration process start barrier timed out')
+                    time.sleep(0.01)
+                with SQLiteStore(sys.argv[2]) as store:
+                    print(json.dumps({
+                        'version': store._connection.execute('PRAGMA user_version').fetchone()[0]
+                    }))
+                """
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        self._source_path(),
+                        str(database),
+                        str(ready_dir),
+                        str(index),
+                    ],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for index in range(2)
+            ]
+            deadline = time.monotonic() + 15
+            while len(list(ready_dir.glob("*.ready"))) < 2:
+                if time.monotonic() > deadline:
+                    for process in processes:
+                        process.terminate()
+                    self.fail("migration subprocess start barrier timed out")
+                time.sleep(0.01)
+            (ready_dir / "go").write_text("go")
+            results = [process.communicate(timeout=25) for process in processes]
+            self.assertEqual(
+                [process.returncode for process in processes],
+                [0, 0],
+                [stderr for _, stderr in results],
+            )
+            self.assertEqual([json.loads(out)["version"] for out, _ in results], [4, 4])
+            backups = list(Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["status"],
+                "VERIFIED",
+            )
+
+    def test_subprocess_termination_during_online_backup_leaves_incomplete_artifact(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "origin.sqlite3"
+            ready = root / "backup-started"
+            with SQLiteStore.initialize(database) as store:
+                for index in range(96):
+                    _record(store, "large_event", {"blob": "x" * 16384, "i": index})
+
+            script = textwrap.dedent(
+                """
+                import pathlib, sys, time
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                ready = pathlib.Path(sys.argv[3])
+                def slow_backup(source, destination):
+                    def progress(status, remaining, total):
+                        if not ready.exists():
+                            ready.write_text('started')
+                            time.sleep(60)
+                    source.backup(destination, pages=1, progress=progress)
+                SQLiteStore._run_online_backup = staticmethod(slow_backup)
+                store = SQLiteStore(sys.argv[2])
+                store._connection.execute('BEGIN IMMEDIATE')
+                store._migration_reservation_active = True
+                store._create_verified_backup(pathlib.Path(sys.argv[2]), version=4)
+                """
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, self._source_path(), str(database), str(ready)],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while not ready.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists(), "child did not enter the backup API")
+            finally:
+                process.terminate()
+                process.communicate(timeout=10)
+            backups = list(root.glob("origin.sqlite3.v4-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            manifest_path = SQLiteStore._backup_manifest_path(backups[0])
+            self.assertTrue(manifest_path.exists())
+            self.assertEqual(
+                json.loads(manifest_path.read_text())["status"], "INCOMPLETE"
+            )
+
+    def test_subprocess_termination_before_verified_manifest_keeps_incomplete_state(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "origin.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "manifest_crash")
+            script = textwrap.dedent(
+                """
+                import os, pathlib, sys
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                original = SQLiteStore._publish_backup_manifest
+                def stop_before_verified(cls, path, manifest, *, exclusive=False):
+                    if manifest.get('status') == 'VERIFIED':
+                        os._exit(42)
+                    return original(path, manifest, exclusive=exclusive)
+                SQLiteStore._publish_backup_manifest = classmethod(stop_before_verified)
+                store = SQLiteStore(sys.argv[2])
+                store._connection.execute('BEGIN IMMEDIATE')
+                store._migration_reservation_active = True
+                store._create_verified_backup(pathlib.Path(sys.argv[2]), version=4)
+                """
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script, self._source_path(), str(database)],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 42, result.stderr)
+            backups = list(Path(directory).glob("origin.sqlite3.v4-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            manifest = json.loads(
+                SQLiteStore._backup_manifest_path(backups[0]).read_text()
+            )
+            self.assertEqual(manifest["status"], "INCOMPLETE")
+
+    def test_subprocess_termination_before_migration_commit_preserves_source_and_backup(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "legacy-v3.sqlite3"
+            ready = root / "migration-ready-to-commit"
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "legacy_before_crash", {"keep": True})
+                store._connection.execute("PRAGMA user_version=3")
+            script = textwrap.dedent(
+                """
+                import pathlib, sys, time
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                ready = pathlib.Path(sys.argv[3])
+                original = SQLiteStore._migrate_v3_to_v4
+                def pause_after_ddl(self, backup_path):
+                    original(self, backup_path)
+                    ready.write_text('ready')
+                    time.sleep(60)
+                SQLiteStore._migrate_v3_to_v4 = pause_after_ddl
+                SQLiteStore(sys.argv[2])
+                """
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, self._source_path(), str(database), str(ready)],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while not ready.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists(), "child did not reach uncommitted migration")
+            finally:
+                process.terminate()
+                process.communicate(timeout=10)
+
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(
+                    connection.execute("SELECT event_type FROM system_events").fetchone()[0],
+                    "legacy_before_crash",
+                )
+            finally:
+                connection.close()
+            backups = list(root.glob("legacy-v3.sqlite3.v3-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["status"],
+                "VERIFIED",
+            )
+
     def test_backup_verification_rejects_unexpected_journal_mode(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
             with SQLiteStore.initialize(database) as store:
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
                 original = SQLiteStore._configure_connection
                 calls = 0
 
                 def change_reopened_backup_mode(instance):
                     nonlocal calls
                     calls += 1
-                    if calls == 2:
+                    if calls == 3:
                         instance._connection.execute("PRAGMA journal_mode=DELETE")
                     return original(instance)
 
@@ -627,24 +1329,7 @@ class StorageTests(unittest.TestCase):
                 backups = list(
                     Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3")
                 )
-                self.assertEqual(len(backups), 1)
-                backup = sqlite3.connect(backups[0])
-                try:
-                    self.assertEqual(
-                        backup.execute("PRAGMA user_version").fetchone()[0], 3
-                    )
-                    self.assertEqual(
-                        backup.execute("PRAGMA integrity_check").fetchone()[0],
-                        "ok",
-                    )
-                    self.assertEqual(
-                        backup.execute(
-                            "SELECT event_type FROM system_events"
-                        ).fetchone()[0],
-                        "legacy_event",
-                    )
-                finally:
-                    backup.close()
+                self.assertEqual(backups, [])
             finally:
                 if reader.in_transaction:
                     reader.execute("ROLLBACK")
@@ -662,12 +1347,23 @@ class StorageTests(unittest.TestCase):
                 events = store.read_events()
                 self.assertEqual(len(events), 1)
                 self.assertEqual(events[0].event_type, "legacy_event")
+            backups = list(
+                Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3")
+            )
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["status"],
+                "VERIFIED",
+            )
 
     def test_v3_wal_policy_migration_preserves_history_and_backup(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "legacy-v3.sqlite3"
             with SQLiteStore.initialize(database) as store:
                 _record(store, "before_v4", {"preserve": True})
+                store._connection.execute(
+                    "UPDATE sqlite_sequence SET seq = 12 WHERE name = 'system_events'"
+                )
                 store._connection.execute("PRAGMA user_version=3")
             with SQLiteStore(database) as store:
                 events = store.read_events()
@@ -677,11 +1373,22 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(store._connection.execute("PRAGMA user_version").fetchone()[0], 4)
             backups = list(Path(directory).glob("legacy-v3.sqlite3.v3-backup-*.sqlite3"))
             self.assertEqual(len(backups), 1)
+            manifest = SQLiteStore._verify_backup_manifest(backups[0])
+            self.assertEqual(manifest["source_schema_version"], 3)
+            self.assertEqual(manifest["event_count"], 1)
+            self.assertEqual(manifest["highest_event_id"], 1)
+            self.assertEqual(manifest["sqlite_sequence"], 12)
             backup = sqlite3.connect(backups[0])
             try:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 3)
                 self.assertEqual(backup.execute("PRAGMA journal_mode").fetchone()[0], "wal")
                 self.assertEqual(backup.execute("SELECT COUNT(*) FROM system_events").fetchone()[0], 1)
+                self.assertEqual(
+                    backup.execute(
+                        "SELECT seq FROM sqlite_sequence WHERE name='system_events'"
+                    ).fetchone()[0],
+                    12,
+                )
             finally:
                 backup.close()
 
@@ -749,8 +1456,9 @@ class StorageTests(unittest.TestCase):
                 "_migrate_v3_to_v4",
                 side_effect=StorageError("injected stop after WAL transition"),
             ):
-                with self.assertRaisesRegex(StorageError, "injected stop"):
+                with self.assertRaisesRegex(StorageError, "Database migration failed") as caught:
                     SQLiteStore(database)
+                self.assertIn("injected stop", str(caught.exception.__cause__))
 
             connection = sqlite3.connect(database)
             try:
@@ -1348,6 +2056,56 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(reopened.read_events(), [])
                 self.assertEqual(_record(reopened, "after_reopen"), 1)
 
+    def test_migration_commit_acknowledgement_failure_reports_uncertain_outcome(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v3.sqlite3"
+            with SQLiteStore.initialize(database) as initial:
+                _record(initial, "legacy_event")
+                initial._connection.execute("PRAGMA user_version=3")
+            connection = sqlite3.connect(database, isolation_level=None)
+            try:
+                connection.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                connection.close()
+
+            raw = SQLiteStore._connect_existing(database.resolve())
+            raw.row_factory = sqlite3.Row
+            injected = FaultInjectingConnection(
+                raw,
+                commit_then_failure=sqlite3.OperationalError(
+                    "injected lost COMMIT acknowledgement"
+                ),
+            )
+            store = SQLiteStore.__new__(SQLiteStore)
+            store._connection = injected
+            store._database_path = database.resolve()
+            store._state = "OPEN"
+            store._connection_close_succeeded = False
+            store._cleanup_errors = []
+            store._migration_reservation_active = False
+            store._configure_connection()
+            store._configure_durability(allow_transition=True)
+
+            with self.assertRaisesRegex(
+                StorageError,
+                "COMMIT outcome is uncertain.*connection was invalidated.*"
+                "Reopen and independently verify",
+            ):
+                store._initialize_schema()
+            self.assertEqual(store._state, "INVALID")
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                store.read_events()
+
+            with SQLiteStore(database) as reopened:
+                self.assertEqual(
+                    reopened._connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    [event.event_type for event in reopened.read_events()],
+                    ["legacy_event"],
+                )
+
     def test_event_persists_after_reopening_database(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
@@ -1472,6 +2230,9 @@ class StorageTests(unittest.TestCase):
                     """,
                     ("legacy_event", "2026-01-01T00:00:00Z", '{"value":7}'),
                 )
+                connection.execute(
+                    "UPDATE sqlite_sequence SET seq = 9 WHERE name = 'system_events'"
+                )
 
                 connection.execute("PRAGMA user_version = 1")
                 connection.commit()
@@ -1509,6 +2270,12 @@ class StorageTests(unittest.TestCase):
                     ).fetchone()[0],
                     None,
                 )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'system_events'"
+                    ).fetchone()[0],
+                    9,
+                )
 
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
@@ -1522,6 +2289,14 @@ class StorageTests(unittest.TestCase):
                 Path(directory).glob("legacy.sqlite3.v1-backup-*.sqlite3")
             )
             self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["source_schema_version"],
+                1,
+            )
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["sqlite_sequence"],
+                9,
+            )
             backup = sqlite3.connect(backups[0])
             try:
                 self.assertEqual(
@@ -1598,6 +2373,10 @@ class StorageTests(unittest.TestCase):
                 Path(directory).glob("legacy-v2.sqlite3.v2-backup-*.sqlite3")
             )
             self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["source_schema_version"],
+                2,
+            )
             backup = sqlite3.connect(backups[0])
             try:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
@@ -1675,6 +2454,10 @@ class StorageTests(unittest.TestCase):
                 Path(directory).glob("legacy.sqlite3.v1-backup-*.sqlite3")
             )
             self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                SQLiteStore._verify_backup_manifest(backups[0])["status"],
+                "VERIFIED",
+            )
             backup = sqlite3.connect(backups[0])
             try:
                 self.assertEqual(
