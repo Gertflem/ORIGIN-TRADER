@@ -93,6 +93,10 @@ _IDEMPOTENCY_KEY_RE = re.compile(
     re.ASCII,
 )
 
+_CONNECTION_OPEN = "OPEN"
+_CONNECTION_INVALID = "INVALID"
+_CONNECTION_CLOSED = "CLOSED"
+
 
 class StorageError(RuntimeError):
     """Raised when persistent storage cannot operate safely."""
@@ -144,18 +148,20 @@ class SQLiteStore:
 
         self._database_path = path
 
-        self._closed = False
+        self._state = _CONNECTION_OPEN
+        self._connection_close_succeeded = False
+        self._cleanup_errors: list[BaseException] = []
 
         try:
             self._connection = self._connect_existing(path)
             self._configure_connection()
             self._initialize_schema()
 
-        except DatabaseMissingError:
-            self._close_failed_connection()
+        except DatabaseMissingError as exc:
+            self._close_failed_connection(exc)
             raise
         except sqlite3.Error as exc:
-            self._close_failed_connection()
+            self._close_failed_connection(exc)
             try:
                 path.stat()
             except FileNotFoundError as stat_exc:
@@ -167,8 +173,8 @@ class SQLiteStore:
                     f"Could not inspect expected database path: {path}"
                 ) from stat_exc
             raise StorageError(f"Could not safely open database: {path}") from exc
-        except Exception:
-            self._close_failed_connection()
+        except BaseException as exc:
+            self._close_failed_connection(exc)
             raise
 
     @staticmethod
@@ -240,11 +246,49 @@ class SQLiteStore:
         self._verify_connection_setting("synchronous", 2)
         self._verify_connection_setting("wal_autocheckpoint", 1000)
 
-    def _close_failed_connection(self) -> None:
+    def _attempt_connection_close(
+        self, cause: BaseException | None = None
+    ) -> BaseException | None:
+        if self._connection_close_succeeded:
+            return None
         connection = getattr(self, "_connection", None)
         if connection is not None:
-            connection.close()
-        self._closed = True
+            try:
+                connection.close()
+            except BaseException as close_error:
+                self._cleanup_errors.append(close_error)
+                if cause is not None:
+                    cause.add_note(
+                        "SQLite connection cleanup also failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                return close_error
+        self._connection_close_succeeded = True
+        return None
+
+    def _invalidate_connection(
+        self,
+        cause: BaseException | None = None,
+        cleanup_errors: tuple[BaseException, ...] = (),
+    ) -> None:
+        if self._state == _CONNECTION_CLOSED:
+            return
+        self._state = _CONNECTION_INVALID
+        for error in cleanup_errors:
+            self._cleanup_errors.append(error)
+            if cause is not None:
+                description = (
+                    self._sqlite_error_description(error)
+                    if isinstance(error, sqlite3.Error)
+                    else f"{type(error).__name__}: {error}"
+                )
+                cause.add_note(
+                    "SQLite transaction cleanup also failed: " + description
+                )
+        self._attempt_connection_close(cause)
+
+    def _close_failed_connection(self, cause: BaseException | None = None) -> None:
+        self._invalidate_connection(cause)
 
     @classmethod
     def initialize(cls, database_path: str | Path) -> "SQLiteStore":
@@ -260,7 +304,9 @@ class SQLiteStore:
             raise ValueError("Database path cannot be empty.")
 
         store = cls.__new__(cls)
-        store._closed = False
+        store._state = _CONNECTION_OPEN
+        store._connection_close_succeeded = False
+        store._cleanup_errors = []
         store._database_path = None
 
         if raw_path == ":memory:":
@@ -275,8 +321,8 @@ class SQLiteStore:
                 store._verify_connection_setting("wal_autocheckpoint", 1000)
                 store._create_initial_schema()
                 return store
-            except Exception:
-                store._close_failed_connection()
+            except BaseException as exc:
+                store._close_failed_connection(exc)
                 raise
 
         path = Path(raw_path)
@@ -304,10 +350,10 @@ class SQLiteStore:
             store._create_initial_schema()
             return store
         except sqlite3.Error as exc:
-            store._close_failed_connection()
+            store._close_failed_connection(exc)
             raise StorageError(f"Could not initialize database: {path}") from exc
-        except Exception:
-            store._close_failed_connection()
+        except BaseException as exc:
+            store._close_failed_connection(exc)
             raise
 
     def _create_initial_schema(self) -> None:
@@ -343,14 +389,67 @@ class SQLiteStore:
             else:
                 self._verify_connection_setting("synchronous", 2)
                 self._verify_connection_setting("wal_autocheckpoint", 1000)
-        except Exception:
-            if self._connection.in_transaction:
-                self._connection.rollback()
+        except BaseException as exc:
+            cleanup_errors = self._rollback_for_error()
+            self._invalidate_connection(exc, cleanup_errors)
             raise
 
     def _ensure_open(self) -> None:
-        if self._closed:
-            raise StorageError("Storage connection is closed.")
+        if self._state != _CONNECTION_OPEN:
+            raise StorageError(
+                f"Storage connection is {self._state.lower()} and cannot be used."
+            )
+
+    @staticmethod
+    def _sqlite_primary_code(exc: sqlite3.Error) -> int | None:
+        code = getattr(exc, "sqlite_errorcode", None)
+        return code & 0xFF if isinstance(code, int) else None
+
+    @staticmethod
+    def _sqlite_error_description(exc: sqlite3.Error) -> str:
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None)
+        return f"{exc} [sqlite_errorcode={code!r}, sqlite_errorname={name!r}]"
+
+    def _rollback_for_error(self) -> tuple[BaseException, ...]:
+        try:
+            active = self._connection.in_transaction
+        except BaseException as state_error:
+            return (state_error,)
+        if not active:
+            return ()
+        try:
+            self._connection.rollback()
+        except BaseException as rollback_error:
+            return (rollback_error,)
+        try:
+            still_active = self._connection.in_transaction
+        except BaseException as state_error:
+            return (state_error,)
+        if still_active:
+            return (
+                StorageError(
+                    "SQLite rollback returned but the transaction remains active."
+                ),
+            )
+        return ()
+
+    def _raise_with_cleanup_failure(
+        self,
+        message: str,
+        cleanup_errors: tuple[BaseException, ...],
+    ) -> StorageError:
+        error = StorageError(message)
+        for cleanup_error in cleanup_errors:
+            description = (
+                SQLiteStore._sqlite_error_description(cleanup_error)
+                if isinstance(cleanup_error, sqlite3.Error)
+                else f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+            error.add_note(
+                "Transaction cleanup also failed: " + description
+            )
+        return error
 
     def _ensure_events_table_exists(self) -> None:
         table = self._connection.execute(
@@ -607,9 +706,18 @@ class SQLiteStore:
                 verifier._verify_schema(expected_version=version)
             finally:
                 verify.close()
-        except Exception as exc:
+        except BaseException as exc:
             if backup is not None:
-                backup.close()
+                try:
+                    backup.close()
+                except BaseException as close_error:
+                    self._cleanup_errors.append(close_error)
+                    exc.add_note(
+                        "Backup connection cleanup also failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+            if not isinstance(exc, Exception):
+                raise
             # Keep any incomplete artifact for diagnosis; it is never treated
             # as a verified backup. SQLite backup is consistent, but this
             # local backup is not protected from a privileged local attacker.
@@ -649,13 +757,17 @@ class SQLiteStore:
             )
             self._verify_schema(expected_version=SCHEMA_VERSION)
             self._connection.commit()
-        except Exception as exc:
-            if self._connection.in_transaction:
-                self._connection.rollback()
-            raise StorageError(
-                "Database migration failed; the original database was rolled "
-                f"back and the verified backup was retained at {backup_path}."
-            ) from exc
+        except BaseException as exc:
+            cleanup_errors = self._rollback_for_error()
+            self._invalidate_connection(exc, cleanup_errors)
+            if not isinstance(exc, Exception):
+                raise
+            error = self._raise_with_cleanup_failure(
+                "Database migration failed; the verified backup was retained "
+                f"at {backup_path}.",
+                cleanup_errors,
+            )
+            raise error from exc
 
     def _migrate_v2_to_v4(self, backup_path: Path) -> None:
         try:
@@ -670,13 +782,17 @@ class SQLiteStore:
             )
             self._verify_schema(expected_version=SCHEMA_VERSION)
             self._connection.commit()
-        except Exception as exc:
-            if self._connection.in_transaction:
-                self._connection.rollback()
-            raise StorageError(
-                "Database migration failed; the original database was rolled "
-                f"back and the verified backup was retained at {backup_path}."
-            ) from exc
+        except BaseException as exc:
+            cleanup_errors = self._rollback_for_error()
+            self._invalidate_connection(exc, cleanup_errors)
+            if not isinstance(exc, Exception):
+                raise
+            error = self._raise_with_cleanup_failure(
+                "Database migration failed; the verified backup was retained "
+                f"at {backup_path}.",
+                cleanup_errors,
+            )
+            raise error from exc
 
     def _migrate_v3_to_v4(self, backup_path: Path) -> None:
         try:
@@ -685,13 +801,17 @@ class SQLiteStore:
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._verify_schema(expected_version=SCHEMA_VERSION)
             self._connection.commit()
-        except Exception as exc:
-            if self._connection.in_transaction:
-                self._connection.rollback()
-            raise StorageError(
-                "Database storage-policy migration failed; the original schema "
-                f"was rolled back and the verified backup was retained at {backup_path}."
-            ) from exc
+        except BaseException as exc:
+            cleanup_errors = self._rollback_for_error()
+            self._invalidate_connection(exc, cleanup_errors)
+            if not isinstance(exc, Exception):
+                raise
+            error = self._raise_with_cleanup_failure(
+                "Database storage-policy migration failed; the verified backup "
+                f"was retained at {backup_path}.",
+                cleanup_errors,
+            )
+            raise error from exc
 
     def _initialize_schema(self) -> None:
         version = self._connection.execute(
@@ -786,8 +906,10 @@ class SQLiteStore:
                 "Event payload must contain valid JSON data."
             ) from exc
 
+        phase = "BEGIN"
         try:
             self._connection.execute("BEGIN IMMEDIATE")
+            phase = "LOOKUP"
             existing = self._connection.execute(
                 """
                 SELECT event_id, event_type, payload_json
@@ -813,6 +935,7 @@ class SQLiteStore:
                 .isoformat(timespec="microseconds")
                 .replace("+00:00", "Z")
             )
+            phase = "INSERT"
             cursor = self._connection.execute(
                 """
                 INSERT INTO system_events (
@@ -831,27 +954,108 @@ class SQLiteStore:
                 )
 
             event_id = int(cursor.lastrowid)
+            phase = "COMMIT"
             self._connection.commit()
             return event_id
 
         except BaseException as exc:
-            if self._connection.in_transaction:
-                try:
-                    self._connection.rollback()
-                except sqlite3.Error as rollback_error:
-                    self._closed = True
+            if phase == "COMMIT" and not isinstance(exc, sqlite3.Error):
+                cleanup_errors = self._rollback_for_error()
+                self._invalidate_connection(exc, cleanup_errors)
+                message = (
+                    "Commit outcome is uncertain; the storage connection was "
+                    "invalidated."
+                )
+                if isinstance(exc, Exception):
+                    error = self._raise_with_cleanup_failure(
+                        message, cleanup_errors
+                    )
+                    raise error from exc
+                exc.add_note(message)
+                raise
+
+            if isinstance(exc, sqlite3.Error):
+                code = self._sqlite_primary_code(exc)
+                cleanup_errors = self._rollback_for_error()
+
+                if phase == "COMMIT":
+                    self._invalidate_connection(exc, cleanup_errors)
+                    error = self._raise_with_cleanup_failure(
+                        "Commit outcome is uncertain; the storage connection "
+                        "was invalidated. " + self._sqlite_error_description(exc),
+                        cleanup_errors,
+                    )
+                    raise error from exc
+
+                if (
+                    phase == "BEGIN"
+                    and code == sqlite3.SQLITE_BUSY
+                    and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+                ):
                     try:
-                        self._connection.close()
-                    except sqlite3.Error:
-                        pass
+                        transaction_active = self._connection.in_transaction
+                    except BaseException as state_error:
+                        cleanup_errors += (state_error,)
+                        transaction_active = True
+                    if not transaction_active and not cleanup_errors:
+                        raise StorageError(
+                            "Could not begin event transaction. "
+                            + self._sqlite_error_description(exc)
+                        ) from exc
+
+                if (
+                    phase == "INSERT"
+                    and code == sqlite3.SQLITE_CONSTRAINT
+                    and not cleanup_errors
+                ):
                     raise StorageError(
-                        "Could not roll back event transaction; "
-                        "the storage connection was closed."
-                    ) from rollback_error
+                        "Event was rejected by a SQLite constraint. "
+                        + self._sqlite_error_description(exc)
+                    ) from exc
+
+                self._invalidate_connection(exc, cleanup_errors)
+                error = self._raise_with_cleanup_failure(
+                    f"SQLite failure during event {phase.lower()}; "
+                    "the storage connection was invalidated. "
+                    + self._sqlite_error_description(exc),
+                    cleanup_errors,
+                )
+                raise error from exc
+
+            if isinstance(exc, IdempotencyConflictError):
+                cleanup_errors = self._rollback_for_error()
+                if not cleanup_errors:
+                    return_error = exc
+                else:
+                    self._invalidate_connection(exc, cleanup_errors)
+                    return_error = self._raise_with_cleanup_failure(
+                        "Idempotency conflict occurred and transaction cleanup "
+                        "failed; the storage connection was invalidated.",
+                        cleanup_errors,
+                    )
+                    raise return_error from exc
+                raise return_error
+
+            if (
+                isinstance(exc, StorageError)
+                and phase == "INSERT"
+                and str(exc) == "Event insert did not insert exactly one row."
+            ):
+                cleanup_errors = self._rollback_for_error()
+                if not cleanup_errors:
+                    raise
+                self._invalidate_connection(exc, cleanup_errors)
+                error = self._raise_with_cleanup_failure(
+                    "Event insertion failed and transaction cleanup failed; "
+                    "the storage connection was invalidated.",
+                    cleanup_errors,
+                )
+                raise error from exc
+
+            cleanup_errors = self._rollback_for_error()
+            self._invalidate_connection(exc, cleanup_errors)
             if isinstance(exc, StorageError):
                 raise
-            if isinstance(exc, sqlite3.Error):
-                raise StorageError("Could not record system event.") from exc
             raise
 
     def read_events(self, limit: int = 100) -> list[StoredEvent]:
@@ -878,30 +1082,78 @@ class SQLiteStore:
                 (limit,),
             ).fetchall()
 
-            return [
-                StoredEvent(
-                    event_id=row["event_id"],
-                    event_type=row["event_type"],
-                    occurred_at_utc=row["occurred_at_utc"],
-                    payload=json.loads(row["payload_json"]),
-                    idempotency_key=row["idempotency_key"],
+            events = []
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if not isinstance(payload, dict):
+                    raise ValueError("Stored event payload must be a JSON object.")
+                events.append(
+                    StoredEvent(
+                        event_id=row["event_id"],
+                        event_type=row["event_type"],
+                        occurred_at_utc=row["occurred_at_utc"],
+                        payload=payload,
+                        idempotency_key=row["idempotency_key"],
+                    )
                 )
-                for row in rows
-            ]
+            return events
 
-        except (sqlite3.Error, json.JSONDecodeError) as exc:
-            raise StorageError("Could not read stored events.") from exc
+        except sqlite3.Error as exc:
+            code = self._sqlite_primary_code(exc)
+            try:
+                transaction_active = self._connection.in_transaction
+            except BaseException as state_error:
+                transaction_active = True
+                self._invalidate_connection(exc, (state_error,))
+
+            if (
+                code == sqlite3.SQLITE_BUSY
+                and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+                and not transaction_active
+            ):
+                raise StorageError(
+                    "Could not read stored events. "
+                    + self._sqlite_error_description(exc)
+                ) from exc
+
+            self._invalidate_connection(exc)
+            raise StorageError(
+                "SQLite read failed; the storage connection was invalidated. "
+                + self._sqlite_error_description(exc)
+            ) from exc
+        except (ValueError, TypeError, UnicodeDecodeError, RecursionError) as exc:
+            self._invalidate_connection(exc)
+            raise StorageError(
+                "Stored event data is malformed; the storage connection was "
+                "invalidated."
+            ) from exc
 
     def close(self) -> None:
         """Close the database connection."""
 
-        if not self._closed:
-            self._connection.close()
-            self._closed = True
+        if (
+            self._state == _CONNECTION_CLOSED
+            and self._connection_close_succeeded
+        ):
+            return
+        self._state = _CONNECTION_CLOSED
+        close_error = self._attempt_connection_close()
+        if close_error is not None:
+            raise StorageError(
+                "SQLite connection close failed; the store remains closed."
+            ) from close_error
 
     def __enter__(self) -> "SQLiteStore":
         self._ensure_open()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc_value is None:
+                raise
+            exc_value.add_note(
+                "SQLite context-manager cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )

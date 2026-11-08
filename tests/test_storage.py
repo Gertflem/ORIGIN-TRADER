@@ -25,6 +25,79 @@ def _record(store, event_type, payload=None):
     return store.record_event(event_type, payload, f"test:{uuid4()}")
 
 
+class FaultInjectingConnection:
+    """Connection proxy for deterministic SQLite failure-path tests."""
+
+    def __init__(
+        self,
+        connection,
+        *,
+        execute_failure=None,
+        execute_match=None,
+        commit_failure=None,
+        commit_then_failure=None,
+        rollback_failure=None,
+        rollback_noop=False,
+        close_failure=None,
+        close_failures_remaining=None,
+    ):
+        self.connection = connection
+        self.execute_failure = execute_failure
+        self.execute_match = execute_match
+        self.commit_failure = commit_failure
+        self.commit_then_failure = commit_then_failure
+        self.rollback_failure = rollback_failure
+        self.rollback_noop = rollback_noop
+        self.close_failure = close_failure
+        self.close_failures_remaining = close_failures_remaining
+        self.close_calls = 0
+
+    def execute(self, sql, *args):
+        if (
+            self.execute_failure is not None
+            and self.execute_match(sql)
+        ):
+            raise self.execute_failure
+        return self.connection.execute(sql, *args)
+
+    def commit(self):
+        if self.commit_then_failure is not None:
+            self.connection.commit()
+            raise self.commit_then_failure
+        if self.commit_failure is not None:
+            raise self.commit_failure
+        return self.connection.commit()
+
+    def rollback(self):
+        if self.rollback_failure is not None:
+            raise self.rollback_failure
+        if self.rollback_noop:
+            return None
+        return self.connection.rollback()
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_failure is not None:
+            if self.close_failures_remaining is None:
+                raise self.close_failure
+            if self.close_failures_remaining > 0:
+                self.close_failures_remaining -= 1
+                raise self.close_failure
+        return self.connection.close()
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+def _sqlite_fault(name, *, extended_code=None):
+    error = sqlite3.OperationalError(f"fault injection: {name}")
+    error.sqlite_errorcode = (
+        getattr(sqlite3, name) if extended_code is None else extended_code
+    )
+    error.sqlite_errorname = name
+    return error
+
+
 class StorageTests(unittest.TestCase):
 
     def _source_path(self):
@@ -1010,20 +1083,270 @@ class StorageTests(unittest.TestCase):
             store._connection.execute("DROP TRIGGER test_reject_insert")
             self.assertEqual(_record(store, "recovered_event"), 1)
 
-    def test_commit_failure_rolls_back_and_does_not_return_event_id(self):
+    def test_begin_busy_does_not_invalidate_connection(self):
         with SQLiteStore.initialize(":memory:") as store:
-            def deny_commit(action, argument1, argument2, database, trigger):
+            store._connection = FaultInjectingConnection(
+                store._connection,
+                execute_failure=_sqlite_fault("SQLITE_BUSY"),
+                execute_match=lambda sql: sql.strip().upper() == "BEGIN IMMEDIATE",
+            )
+            with self.assertRaisesRegex(StorageError, "SQLITE_BUSY"):
+                _record(store, "busy_begin")
+            self.assertEqual(store._state, "OPEN")
+            store._connection.execute_failure = None
+            self.assertEqual(_record(store, "after_busy"), 1)
+
+    def test_rollback_failure_invalidates_and_records_both_errors(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            store._connection.execute(
+                """
+                CREATE TRIGGER reject_rollback_test
+                BEFORE INSERT ON system_events
+                WHEN NEW.event_type = 'rollback_failure'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END
+                """
+            )
+            connection = store._connection
+            store._connection = FaultInjectingConnection(
+                connection,
+                rollback_failure=sqlite3.OperationalError("injected rollback failure"),
+            )
+            with self.assertRaises(StorageError) as raised:
+                _record(store, "rollback_failure")
+            self.assertEqual(store._state, "INVALID")
+            self.assertIsInstance(raised.exception.__cause__, sqlite3.Error)
+            self.assertTrue(store._cleanup_errors)
+            self.assertTrue(
+                any("transaction cleanup also failed" in note.lower()
+                    for note in raised.exception.__notes__)
+            )
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                store.read_events()
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                _record(store, "after_rollback_failure")
+
+    def test_rollback_returning_with_active_transaction_invalidates_connection(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            store._connection.execute(
+                """
+                CREATE TRIGGER reject_noop_rollback_test
+                BEFORE INSERT ON system_events
+                WHEN NEW.event_type = 'rollback_postcondition'
+                BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END
+                """
+            )
+            connection = store._connection
+            proxy = FaultInjectingConnection(connection, rollback_noop=True)
+            store._connection = proxy
+
+            with self.assertRaises(StorageError) as raised:
+                _record(store, "rollback_postcondition")
+
+            self.assertTrue(
+                any(
+                    "transaction remains active" in str(error)
+                    for error in store._cleanup_errors
+                )
+            )
+            self.assertEqual(store._state, "INVALID")
+            self.assertIsInstance(raised.exception.__cause__, sqlite3.Error)
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                store.read_events()
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                _record(store, "after_noop_rollback")
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+
+    def test_fault_injected_serious_sqlite_write_errors_invalidate_connection(self):
+        faults = (
+            ("SQLITE_IOERR", sqlite3.SQLITE_IOERR),
+            ("SQLITE_FULL", sqlite3.SQLITE_FULL),
+            ("SQLITE_CORRUPT", sqlite3.SQLITE_CORRUPT),
+            ("SQLITE_NOTADB", sqlite3.SQLITE_NOTADB),
+            ("SQLITE_PROTOCOL", sqlite3.SQLITE_PROTOCOL),
+            ("SQLITE_READONLY", sqlite3.SQLITE_READONLY),
+            ("SQLITE_LOCKED", sqlite3.SQLITE_LOCKED),
+            ("SQLITE_CANTOPEN", sqlite3.SQLITE_CANTOPEN),
+            ("SQLITE_INTERNAL", sqlite3.SQLITE_INTERNAL),
+            ("SQLITE_IOERR_READ", sqlite3.SQLITE_IOERR | (1 << 8)),
+        )
+        for name, code in faults:
+            with self.subTest(name=name), SQLiteStore.initialize(":memory:") as store:
+                connection = store._connection
+                store._connection = FaultInjectingConnection(
+                    connection,
+                    execute_failure=_sqlite_fault(name, extended_code=code),
+                    execute_match=lambda sql: "INSERT INTO SYSTEM_EVENTS" in sql.upper(),
+                )
+                with self.assertRaises(StorageError) as raised:
+                    _record(store, "serious_write_error")
+                self.assertEqual(store._state, "INVALID")
+                self.assertIn(name, str(raised.exception))
+                self.assertIn(str(code), str(raised.exception))
+                with self.assertRaisesRegex(StorageError, "invalid"):
+                    store.read_events()
+                with self.assertRaisesRegex(StorageError, "invalid"):
+                    _record(store, "after_serious_error")
+
+    def test_commit_error_invalidates_connection_and_does_not_return_event_id(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            connection = store._connection
+            store._connection = FaultInjectingConnection(
+                connection,
+                commit_failure=_sqlite_fault("SQLITE_IOERR"),
+            )
+            with self.assertRaisesRegex(StorageError, "outcome is uncertain"):
+                _record(store, "commit_failure")
+            self.assertEqual(store._state, "INVALID")
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                _record(store, "after_commit_failure")
+
+    def test_commit_succeeds_then_raises_and_fresh_retry_is_idempotent(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "ambiguous-commit.sqlite3"
+            key = f"test:{uuid4()}"
+            store = SQLiteStore.initialize(database)
+            connection = store._connection
+            store._connection = FaultInjectingConnection(
+                connection,
+                commit_then_failure=_sqlite_fault("SQLITE_IOERR"),
+            )
+            with self.assertRaisesRegex(StorageError, "outcome is uncertain"):
+                store.record_event("ambiguous_commit", {"value": 1}, key)
+            self.assertEqual(store._state, "INVALID")
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                store.read_events()
+
+            with SQLiteStore(database) as fresh_store:
+                self.assertEqual(
+                    fresh_store._connection.execute("PRAGMA journal_mode").fetchone()[0],
+                    "wal",
+                )
+                self.assertEqual(
+                    fresh_store._connection.execute("PRAGMA synchronous").fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    fresh_store._connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0],
+                    1000,
+                )
+                self.assertEqual(
+                    fresh_store._connection.execute("PRAGMA user_version").fetchone()[0],
+                    4,
+                )
+                self.assertEqual(
+                    fresh_store._connection.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
+                )
+                before_retry = fresh_store.read_events()
+                self.assertEqual(len(before_retry), 1)
+                committed_id = before_retry[0].event_id
+                retried_id = fresh_store.record_event(
+                    "ambiguous_commit", {"value": 1}, key
+                )
+                self.assertEqual(retried_id, committed_id)
+                self.assertEqual(len(fresh_store.read_events()), 1)
+
+    def test_fault_injected_serious_read_error_invalidates_connection(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            connection = store._connection
+            store._connection = FaultInjectingConnection(
+                connection,
+                execute_failure=_sqlite_fault("SQLITE_CORRUPT"),
+                execute_match=lambda sql: "FROM SYSTEM_EVENTS" in sql.upper(),
+            )
+            with self.assertRaisesRegex(StorageError, "invalidated") as raised:
+                store.read_events()
+            self.assertIn("SQLITE_CORRUPT", str(raised.exception))
+            self.assertEqual(store._state, "INVALID")
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                _record(store, "after_read_error")
+
+    def test_malformed_persisted_json_invalidates_without_skipping_event(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            store._connection.execute(
+                """
+                INSERT INTO system_events (
+                    event_type, occurred_at_utc, payload_json, idempotency_key
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    "malformed_payload",
+                    "2026-01-01T00:00:00Z",
+                    "[]",
+                    f"test:{uuid4()}",
+                ),
+            )
+            with self.assertRaisesRegex(StorageError, "malformed"):
+                store.read_events()
+            self.assertEqual(store._state, "INVALID")
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                store.read_events()
+
+    def test_failed_close_can_be_retried_without_reopening_store(self):
+        store = SQLiteStore.initialize(":memory:")
+        connection = store._connection
+        proxy = FaultInjectingConnection(
+            connection,
+            close_failure=OSError("injected close failure"),
+            close_failures_remaining=1,
+        )
+        store._connection = proxy
+        with self.assertRaisesRegex(StorageError, "close failed"):
+            store.close()
+        self.assertEqual(store._state, "CLOSED")
+        self.assertIsInstance(store._cleanup_errors[0], OSError)
+        self.assertEqual(proxy.close_calls, 1)
+        with self.assertRaisesRegex(StorageError, "closed"):
+            store.read_events()
+        with self.assertRaisesRegex(StorageError, "closed"):
+            _record(store, "after_close_failure")
+
+        store.close()
+        self.assertEqual(proxy.close_calls, 2)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        store.close()
+        self.assertEqual(proxy.close_calls, 2)
+        with self.assertRaisesRegex(StorageError, "closed"):
+            store.read_events()
+
+    def test_context_cleanup_failure_does_not_mask_body_exception(self):
+        store = SQLiteStore.initialize(":memory:")
+        connection = store._connection
+        store._connection = FaultInjectingConnection(
+            connection, close_failure=OSError("injected close failure")
+        )
+        with self.assertRaisesRegex(RuntimeError, "body failure") as raised:
+            with store:
+                raise RuntimeError("body failure")
+        self.assertEqual(store._state, "CLOSED")
+        self.assertTrue(
+            any("context-manager cleanup also failed" in note
+                for note in raised.exception.__notes__)
+        )
+        connection.close()
+
+    def test_commit_failure_rolls_back_and_does_not_return_event_id(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "commit-failure.sqlite3"
+            store = SQLiteStore.initialize(database)
+
+            def deny_commit(action, argument1, argument2, database_name, trigger):
                 if action == sqlite3.SQLITE_TRANSACTION and argument1 == "COMMIT":
                     return sqlite3.SQLITE_DENY
                 return sqlite3.SQLITE_OK
 
             store._connection.set_authorizer(deny_commit)
-            with self.assertRaises(StorageError):
+            with self.assertRaisesRegex(StorageError, "outcome is uncertain"):
                 _record(store, "commit_failure")
-            store._connection.set_authorizer(None)
+            self.assertEqual(store._state, "INVALID")
+            with self.assertRaisesRegex(StorageError, "invalid"):
+                _record(store, "after_commit_failure")
 
-            self.assertEqual(store.read_events(), [])
-            self.assertEqual(_record(store, "after_commit_failure"), 1)
+            with SQLiteStore(database) as reopened:
+                self.assertEqual(reopened.read_events(), [])
+                self.assertEqual(_record(reopened, "after_reopen"), 1)
 
     def test_event_persists_after_reopening_database(self):
         with TemporaryDirectory() as directory:
@@ -1072,10 +1395,16 @@ class StorageTests(unittest.TestCase):
 
     def test_closed_database_rejects_operations(self):
         store = SQLiteStore.initialize(":memory:")
+        self.assertEqual(store._state, "OPEN")
+        self.assertEqual(_record(store, "while_open"), 1)
+        store.close()
+        self.assertEqual(store._state, "CLOSED")
         store.close()
 
         with self.assertRaises(StorageError):
             store.read_events()
+        with self.assertRaises(StorageError):
+            _record(store, "while_closed")
 
     def test_existing_events_cannot_be_updated(self):
         with TemporaryDirectory() as directory:
