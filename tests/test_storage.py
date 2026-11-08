@@ -1,20 +1,320 @@
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import sys
+import textwrap
 from threading import Barrier
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from uuid import uuid4
 
 from origin_trader.storage.sqlite_store import (
     DatabaseMissingError,
+    IdempotencyConflictError,
     SCHEMA_VERSION,
     SQLiteStore,
     StorageError,
 )
 
 
+def _record(store, event_type, payload=None):
+    """Submit a test event with a fresh valid key unless a test needs reuse."""
+    return store.record_event(event_type, payload, f"test:{uuid4()}")
+
+
 class StorageTests(unittest.TestCase):
+
+    def _source_path(self):
+        return str(Path(__file__).resolve().parents[1] / "src")
+
+    def _run_competing_submissions(self, database, key, submissions):
+        with TemporaryDirectory() as directory:
+            ready_dir = Path(directory)
+            script = textwrap.dedent(
+                """
+                import json, pathlib, sys, time
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import (
+                    IdempotencyConflictError, SQLiteStore
+                )
+                database, key, event_type, payload_text, ready_dir, label = sys.argv[2:]
+                ready = pathlib.Path(ready_dir)
+                store = SQLiteStore(database)
+                (ready / (label + '.ready')).write_text('ready')
+                deadline = time.monotonic() + 15
+                while len(list(ready.glob('*.ready'))) < 2:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('concurrent start barrier timed out')
+                    time.sleep(0.01)
+                try:
+                    event_id = store.record_event(
+                        event_type, json.loads(payload_text), key
+                    )
+                    print(json.dumps({'result': 'ok', 'event_id': event_id}))
+                except IdempotencyConflictError:
+                    print(json.dumps({'result': 'conflict'}))
+                finally:
+                    store.close()
+                """
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        self._source_path(),
+                        str(database),
+                        key,
+                        event_type,
+                        json.dumps(payload),
+                        str(ready_dir),
+                        str(index),
+                    ],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for index, (event_type, payload) in enumerate(submissions)
+            ]
+            outcomes = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=25)
+                self.assertEqual(process.returncode, 0, stderr)
+                outcomes.append(json.loads(stdout.strip().splitlines()[-1]))
+            return outcomes
+
+    def test_idempotent_repeat_returns_same_event_for_canonical_payload(self):
+        key = f"test:{uuid4()}"
+        with SQLiteStore.initialize(":memory:") as store:
+            first_id = store.record_event("same_event", {"a": 1, "b": 2}, key)
+            repeated_id = store.record_event("same_event", {"b": 2, "a": 1}, key)
+
+            self.assertEqual(repeated_id, first_id)
+            events = store.read_events()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].idempotency_key, key)
+
+    def test_idempotency_key_reuse_with_different_event_type_or_payload_fails(self):
+        key = f"test:{uuid4()}"
+        with SQLiteStore.initialize(":memory:") as store:
+            event_id = store.record_event("original", {"value": 1}, key)
+
+            with self.assertRaises(IdempotencyConflictError):
+                store.record_event("different_type", {"value": 1}, key)
+            with self.assertRaises(IdempotencyConflictError):
+                store.record_event("original", {"value": 2}, key)
+            self.assertFalse(store._connection.in_transaction)
+
+            unrelated_id = store.record_event(
+                "unrelated_event", {"value": 3}, f"test:{uuid4()}"
+            )
+
+            events = store.read_events()
+            self.assertEqual(len(events), 2)
+            self.assertEqual(events[0].event_id, event_id)
+            self.assertEqual(events[0].event_type, "original")
+            self.assertEqual(events[0].payload, {"value": 1})
+            self.assertEqual(events[1].event_id, unrelated_id)
+            self.assertEqual(events[1].event_type, "unrelated_event")
+
+    def test_idempotency_survives_close_and_reopen(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "idempotent.sqlite3"
+            key = f"test:{uuid4()}"
+            with SQLiteStore.initialize(database) as store:
+                event_id = store.record_event("restart_event", {"x": 1}, key)
+            with SQLiteStore(database) as store:
+                repeated_id = store.record_event("restart_event", {"x": 1}, key)
+                self.assertEqual(repeated_id, event_id)
+                self.assertEqual(len(store.read_events()), 1)
+
+    def test_invalid_idempotency_keys_are_rejected(self):
+        invalid_keys = [
+            "Test:550e8400-e29b-41d4-a716-446655440000",
+            "test :550e8400-e29b-41d4-a716-446655440000",
+            "test:550E8400-e29b-41d4-a716-446655440000",
+            "test:550e8400e29b41d4a716446655440000",
+            "1test:550e8400-e29b-41d4-a716-446655440000",
+            "test-" + ("a" * 49) + ":550e8400-e29b-41d4-a716-446655440000",
+            "test:550e8400-e29b-41d4-a716-446655440000\n",
+        ]
+        with SQLiteStore.initialize(":memory:") as store:
+            for key in invalid_keys:
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    store.record_event("invalid_key", {}, key)
+            self.assertEqual(store.read_events(), [])
+
+    def test_idempotency_key_argument_is_required(self):
+        with SQLiteStore.initialize(":memory:") as store:
+            with self.assertRaises(TypeError):
+                store.record_event("missing_key", {})
+
+    def test_database_trigger_rejects_missing_or_invalid_idempotency_key(self):
+        valid_uuid = "550e8400-e29b-41d4-a716-446655440000"
+        invalid_keys = [
+            "test:" + valid_uuid + "\x00trailing",
+            "test:550E8400-e29b-41d4-a716-446655440000",
+            "test:" + valid_uuid + ":extra",
+            "test :" + valid_uuid,
+            "test:not-a-valid-uuid",
+            "bad_namespace:" + valid_uuid,
+        ]
+        with SQLiteStore.initialize(":memory:") as store:
+            candidates = [(None, "null key"), ("invalid-key", "malformed key")]
+            candidates.extend((key, key) for key in invalid_keys)
+            candidates.append(
+                (sqlite3.Binary(b"test:" + valid_uuid.encode("ascii")), "BLOB key")
+            )
+
+            for key, label in candidates:
+                with self.subTest(key=label), self.assertRaises(sqlite3.IntegrityError):
+                    store._connection.execute(
+                        """
+                        INSERT INTO system_events (
+                            event_type, occurred_at_utc, payload_json, idempotency_key
+                        ) VALUES ('raw_event', '2026-01-01T00:00:00Z', '{}', ?)
+                        """,
+                        (key,),
+                    )
+            self.assertEqual(store.read_events(), [])
+
+    def test_schema_v3_exact_idempotency_definitions_open_successfully(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "verified-v3.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+            with SQLiteStore(database) as store:
+                store._verify_schema(expected_version=SCHEMA_VERSION)
+
+    def test_unique_partial_index_rejects_duplicate_non_null_key(self):
+        key = f"test:{uuid4()}"
+        with SQLiteStore.initialize(":memory:") as store:
+            store._connection.execute(
+                """
+                INSERT INTO system_events (
+                    event_type, occurred_at_utc, payload_json, idempotency_key
+                ) VALUES ('raw_event', '2026-01-01T00:00:00Z', '{}', ?)
+                """,
+                (key,),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                store._connection.execute(
+                    """
+                    INSERT INTO system_events (
+                        event_type, occurred_at_utc, payload_json, idempotency_key
+                    ) VALUES ('raw_event', '2026-01-01T00:00:01Z', '{}', ?)
+                    """,
+                    (key,),
+                )
+            self.assertEqual(len(store.read_events()), 1)
+
+    def test_concurrent_processes_with_same_key_create_one_event(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "concurrent.sqlite3"
+            key = f"test:{uuid4()}"
+            with SQLiteStore.initialize(database):
+                pass
+            outcomes = self._run_competing_submissions(
+                database,
+                key,
+                [
+                    ("concurrent_event", {"value": 1}),
+                    ("concurrent_event", {"value": 1}),
+                ],
+            )
+            self.assertEqual([result["result"] for result in outcomes], ["ok", "ok"])
+            self.assertEqual(outcomes[0]["event_id"], outcomes[1]["event_id"])
+            with SQLiteStore(database) as store:
+                self.assertEqual(len(store.read_events()), 1)
+
+    def test_concurrent_processes_with_conflicting_content_return_one_conflict(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "conflicting.sqlite3"
+            key = f"test:{uuid4()}"
+            with SQLiteStore.initialize(database):
+                pass
+            outcomes = self._run_competing_submissions(
+                database,
+                key,
+                [
+                    ("concurrent_event", {"value": 1}),
+                    ("concurrent_event", {"value": 2}),
+                ],
+            )
+            self.assertCountEqual(
+                [result["result"] for result in outcomes], ["ok", "conflict"]
+            )
+            with SQLiteStore(database) as store:
+                self.assertEqual(len(store.read_events()), 1)
+
+    def test_subprocess_lost_acknowledgement_retry_returns_committed_event(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "lost-ack.sqlite3"
+            key = f"test:{uuid4()}"
+            with SQLiteStore.initialize(database):
+                pass
+            script = textwrap.dedent(
+                """
+                import os, sys
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                store = SQLiteStore(sys.argv[2])
+                store.record_event('lost_ack', {'value': 1}, sys.argv[3])
+                os._exit(73)
+                """
+            )
+            process = subprocess.run(
+                [sys.executable, "-c", script, self._source_path(), str(database), key],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(process.returncode, 73)
+            with SQLiteStore(database) as store:
+                event_id = store.record_event("lost_ack", {"value": 1}, key)
+                self.assertEqual(len(store.read_events()), 1)
+                self.assertEqual(store.read_events()[0].event_id, event_id)
+
+    def test_subprocess_termination_before_commit_leaves_key_available(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "before-commit.sqlite3"
+            key = f"test:{uuid4()}"
+            with SQLiteStore.initialize(database):
+                pass
+            script = textwrap.dedent(
+                """
+                import os, sys
+                sys.path.insert(0, sys.argv[1])
+                from origin_trader.storage.sqlite_store import SQLiteStore
+                store = SQLiteStore(sys.argv[2])
+                store._connection.create_function('crash_now', 0, lambda: os._exit(74))
+                store._connection.execute('''
+                    CREATE TEMP TRIGGER terminate_before_commit
+                    AFTER INSERT ON system_events
+                    BEGIN SELECT crash_now(); END
+                ''')
+                store.record_event('before_commit', {'value': 1}, sys.argv[3])
+                """
+            )
+            process = subprocess.run(
+                [sys.executable, "-c", script, self._source_path(), str(database), key],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(process.returncode, 74, process.stderr)
+            with SQLiteStore(database) as store:
+                event_id = store.record_event("before_commit", {"value": 1}, key)
+                events = store.read_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].event_id, event_id)
 
     def test_database_is_created_with_correct_schema(self):
         with TemporaryDirectory() as directory:
@@ -49,7 +349,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "established.sqlite3"
             with SQLiteStore.initialize(database) as store:
-                store.record_event("historical_event", {"value": 7})
+                _record(store, "historical_event", {"value": 7})
 
             database.unlink()
             with self.assertRaises(DatabaseMissingError):
@@ -60,7 +360,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "existing.sqlite3"
             with SQLiteStore.initialize(database) as store:
-                store.record_event("preserve_me", {"value": 9})
+                _record(store, "preserve_me", {"value": 9})
 
             with self.assertRaisesRegex(StorageError, "already exists"):
                 SQLiteStore.initialize(database)
@@ -81,7 +381,7 @@ class StorageTests(unittest.TestCase):
                 barrier.wait()
                 try:
                     with SQLiteStore.initialize(database) as store:
-                        store.record_event("winning_initialization")
+                        _record(store, "winning_initialization")
                     return "initialized"
                 except StorageError:
                     return "refused"
@@ -224,7 +524,7 @@ class StorageTests(unittest.TestCase):
             database = Path(directory) / "origin.sqlite3"
 
             with SQLiteStore.initialize(database) as store:
-                store.record_event("original_event", {"value": 1})
+                _record(store, "original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
             try:
@@ -233,8 +533,10 @@ class StorageTests(unittest.TestCase):
                     connection.execute(
                         """
                         INSERT OR REPLACE INTO system_events (
-                            event_id, event_type, occurred_at_utc, payload_json
-                        ) VALUES (1, 'replacement', '2026-01-01T00:00:00Z', '{}')
+                            event_id, event_type, occurred_at_utc, payload_json,
+                            idempotency_key
+                        ) VALUES (1, 'replacement', '2026-01-01T00:00:00Z', '{}',
+                                  'test:550e8400-e29b-41d4-a716-446655440000')
                         """
                     )
                 event = connection.execute(
@@ -249,7 +551,7 @@ class StorageTests(unittest.TestCase):
             database = Path(directory) / "origin.sqlite3"
 
             with SQLiteStore.initialize(database) as store:
-                store.record_event("original_event", {"value": 1})
+                _record(store, "original_event", {"value": 1})
 
                 recursive_triggers = store._connection.execute(
                     "PRAGMA recursive_triggers"
@@ -260,8 +562,10 @@ class StorageTests(unittest.TestCase):
                     store._connection.execute(
                         """
                         INSERT OR REPLACE INTO system_events (
-                            event_id, event_type, occurred_at_utc, payload_json
-                        ) VALUES (1, 'replacement', '2026-01-01T00:00:00Z', '{}')
+                            event_id, event_type, occurred_at_utc, payload_json,
+                            idempotency_key
+                        ) VALUES (1, 'replacement', '2026-01-01T00:00:00Z', '{}',
+                                  'test:550e8400-e29b-41d4-a716-446655440000')
                         """
                     )
 
@@ -274,7 +578,7 @@ class StorageTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
             with SQLiteStore.initialize(database) as store:
-                store.record_event("original_event", {"value": 1})
+                _record(store, "original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
             try:
@@ -282,8 +586,10 @@ class StorageTests(unittest.TestCase):
                     connection.execute(
                         """
                         INSERT INTO system_events (
-                            event_id, event_type, occurred_at_utc, payload_json
-                        ) VALUES (1, 'replacement', '2026-01-01T00:00:00Z', '{}')
+                            event_id, event_type, occurred_at_utc, payload_json,
+                            idempotency_key
+                        ) VALUES (1, 'replacement', '2026-01-01T00:00:00Z', '{}',
+                                  'test:550e8400-e29b-41d4-a716-446655440000')
                         ON CONFLICT(event_id) DO UPDATE
                         SET event_type = excluded.event_type
                         """
@@ -304,10 +610,10 @@ class StorageTests(unittest.TestCase):
                 """
             )
             with self.assertRaises(StorageError):
-                store.record_event("ignored_event")
+                _record(store, "ignored_event")
             self.assertEqual(store.read_events(), [])
             store._connection.execute("DROP TRIGGER test_ignore_insert")
-            self.assertEqual(store.record_event("valid_event"), 1)
+            self.assertEqual(_record(store, "valid_event"), 1)
 
     def test_failed_insert_rolls_back_and_store_remains_usable(self):
         with SQLiteStore.initialize(":memory:") as store:
@@ -322,10 +628,10 @@ class StorageTests(unittest.TestCase):
                 """
             )
             with self.assertRaises(StorageError):
-                store.record_event("rejected_event")
+                _record(store, "rejected_event")
             self.assertEqual(store.read_events(), [])
             store._connection.execute("DROP TRIGGER test_reject_insert")
-            self.assertEqual(store.record_event("recovered_event"), 1)
+            self.assertEqual(_record(store, "recovered_event"), 1)
 
     def test_commit_failure_rolls_back_and_does_not_return_event_id(self):
         with SQLiteStore.initialize(":memory:") as store:
@@ -336,18 +642,19 @@ class StorageTests(unittest.TestCase):
 
             store._connection.set_authorizer(deny_commit)
             with self.assertRaises(StorageError):
-                store.record_event("commit_failure")
+                _record(store, "commit_failure")
             store._connection.set_authorizer(None)
 
             self.assertEqual(store.read_events(), [])
-            self.assertEqual(store.record_event("after_commit_failure"), 1)
+            self.assertEqual(_record(store, "after_commit_failure"), 1)
 
     def test_event_persists_after_reopening_database(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "origin.sqlite3"
 
             with SQLiteStore.initialize(database) as store:
-                event_id = store.record_event(
+                event_id = _record(
+                    store,
                     "startup_completed",
                     {"mode": "OBSERVE"},
                 )
@@ -364,7 +671,8 @@ class StorageTests(unittest.TestCase):
     def test_invalid_payload_is_rejected(self):
         with SQLiteStore.initialize(":memory:") as store:
             with self.assertRaises(ValueError):
-                store.record_event(
+                _record(
+                    store,
                     "invalid_event",
                     {"bad_value": object()},
                 )
@@ -397,7 +705,7 @@ class StorageTests(unittest.TestCase):
             database = Path(directory) / "origin.sqlite3"
 
             with SQLiteStore.initialize(database) as store:
-                store.record_event("original_event", {"value": 1})
+                _record(store, "original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
 
@@ -418,7 +726,7 @@ class StorageTests(unittest.TestCase):
             database = Path(directory) / "origin.sqlite3"
 
             with SQLiteStore.initialize(database) as store:
-                store.record_event("original_event", {"value": 1})
+                _record(store, "original_event", {"value": 1})
 
             connection = sqlite3.connect(database)
 
@@ -471,6 +779,7 @@ class StorageTests(unittest.TestCase):
                 self.assertEqual(len(events), 1)
                 self.assertEqual(events[0].event_type, "legacy_event")
                 self.assertEqual(events[0].payload["value"], 7)
+                self.assertIsNone(events[0].idempotency_key)
 
             connection = sqlite3.connect(database)
 
@@ -480,6 +789,12 @@ class StorageTests(unittest.TestCase):
                 ).fetchone()[0]
 
                 self.assertEqual(version, SCHEMA_VERSION)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT idempotency_key FROM system_events WHERE event_id = 1"
+                    ).fetchone()[0],
+                    None,
+                )
 
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
@@ -507,6 +822,66 @@ class StorageTests(unittest.TestCase):
                         "SELECT event_type FROM system_events"
                     ).fetchone()[0],
                     "legacy_event",
+                )
+            finally:
+                backup.close()
+
+    def test_version_two_database_is_migrated_without_data_loss(self):
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy-v2.sqlite3"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE system_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_type TEXT NOT NULL CHECK(length(trim(event_type)) > 0),
+                        occurred_at_utc TEXT NOT NULL,
+                        payload_json TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO system_events (
+                        event_id, event_type, occurred_at_utc, payload_json
+                    ) VALUES (7, 'legacy_v2', '2026-01-02T00:00:00Z', '{"n":2}')
+                    """
+                )
+                connection.executescript(
+                    """
+                    CREATE TRIGGER system_events_reject_update
+                    BEFORE UPDATE ON system_events
+                    BEGIN SELECT RAISE(ABORT, 'system_events is append-only'); END;
+                    CREATE TRIGGER system_events_reject_delete
+                    BEFORE DELETE ON system_events
+                    BEGIN SELECT RAISE(ABORT, 'system_events is append-only'); END;
+                    PRAGMA user_version = 2;
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with SQLiteStore(database) as store:
+                events = store.read_events()
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0].event_id, 7)
+                self.assertEqual(events[0].event_type, "legacy_v2")
+                self.assertEqual(events[0].occurred_at_utc, "2026-01-02T00:00:00Z")
+                self.assertEqual(events[0].payload, {"n": 2})
+                self.assertIsNone(events[0].idempotency_key)
+
+            backups = list(
+                Path(directory).glob("legacy-v2.sqlite3.v2-backup-*.sqlite3")
+            )
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(backups[0])
+            try:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(
+                    backup.execute("SELECT event_id FROM system_events").fetchone()[0],
+                    7,
                 )
             finally:
                 backup.close()

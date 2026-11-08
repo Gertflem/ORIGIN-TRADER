@@ -6,15 +6,19 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+_V2_SCHEMA_VERSION = 2
 
 _UPDATE_TRIGGER = "system_events_reject_update"
 _DELETE_TRIGGER = "system_events_reject_delete"
+_IDEMPOTENCY_TRIGGER = "system_events_require_idempotency_key"
+_IDEMPOTENCY_INDEX = "system_events_idempotency_key_uq"
 _V1_TABLE_SQL = """
     CREATE TABLE system_events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,6 +36,61 @@ _V2_TABLE_SQL = """
         payload_json TEXT NOT NULL
     )
 """
+_V3_TABLE_SQL = """
+    CREATE TABLE system_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL
+            CHECK(length(trim(event_type)) > 0),
+        occurred_at_utc TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        idempotency_key TEXT
+    )
+"""
+
+_IDEMPOTENCY_INDEX_SQL = f"""
+    CREATE UNIQUE INDEX {_IDEMPOTENCY_INDEX}
+    ON system_events (idempotency_key)
+    WHERE idempotency_key IS NOT NULL
+"""
+_IDEMPOTENCY_TRIGGER_SQL = f"""
+    CREATE TRIGGER IF NOT EXISTS {_IDEMPOTENCY_TRIGGER}
+    BEFORE INSERT ON system_events
+    WHEN CASE
+      WHEN NEW.idempotency_key IS NULL THEN 1
+      WHEN typeof(NEW.idempotency_key) != 'text' THEN 1
+      WHEN instr(CAST(NEW.idempotency_key AS BLOB), X'00') > 0 THEN 1
+      WHEN length(NEW.idempotency_key) < 38 THEN 1
+      WHEN length(NEW.idempotency_key) > 85 THEN 1
+      WHEN instr(NEW.idempotency_key, ':') < 2 THEN 1
+      WHEN instr(
+          substr(NEW.idempotency_key, instr(NEW.idempotency_key, ':') + 1),
+          ':'
+      ) != 0 THEN 1
+      WHEN length(
+          substr(NEW.idempotency_key, 1,
+                 instr(NEW.idempotency_key, ':') - 1)
+      ) > 48 THEN 1
+      WHEN substr(NEW.idempotency_key, 1, 1) NOT GLOB '[a-z]' THEN 1
+      WHEN substr(NEW.idempotency_key, 1,
+                  instr(NEW.idempotency_key, ':') - 1)
+           GLOB '*[^a-z0-9-]*' THEN 1
+      WHEN length(
+          substr(NEW.idempotency_key, instr(NEW.idempotency_key, ':') + 1)
+      ) != 36 THEN 1
+      WHEN substr(NEW.idempotency_key, instr(NEW.idempotency_key, ':') + 1)
+           NOT GLOB
+           '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' THEN 1
+      ELSE 0
+    END
+    BEGIN
+        SELECT RAISE(ABORT, 'valid idempotency key required');
+    END
+"""
+_IDEMPOTENCY_KEY_RE = re.compile(
+    r"[a-z][a-z0-9-]{0,47}:"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.ASCII,
+)
 
 
 class StorageError(RuntimeError):
@@ -42,12 +101,17 @@ class DatabaseMissingError(StorageError):
     """Raised when an expected database file does not exist."""
 
 
+class IdempotencyConflictError(StorageError):
+    """Raised when an idempotency key is reused for different event data."""
+
+
 @dataclass(frozen=True, slots=True)
 class StoredEvent:
     event_id: int
     event_type: str
     occurred_at_utc: str
     payload: dict[str, Any]
+    idempotency_key: str | None = None
 
 
 class SQLiteStore:
@@ -214,8 +278,9 @@ class SQLiteStore:
                     "Database is not empty; refusing initialization."
                 )
 
-            self._connection.execute(_V2_TABLE_SQL)
+            self._connection.execute(_V3_TABLE_SQL)
             self._install_append_only_triggers()
+            self._install_idempotency_protection()
             self._connection.execute(
                 f"PRAGMA user_version = {SCHEMA_VERSION}"
             )
@@ -264,6 +329,10 @@ class SQLiteStore:
             """
         )
 
+    def _install_idempotency_protection(self) -> None:
+        self._connection.execute(_IDEMPOTENCY_INDEX_SQL)
+        self._connection.execute(_IDEMPOTENCY_TRIGGER_SQL)
+
     def _verify_append_only_triggers(self) -> None:
         rows = self._connection.execute(
             """
@@ -301,6 +370,10 @@ class SQLiteStore:
                 END
             """,
         }
+        if self._connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0] == SCHEMA_VERSION:
+            expected[_IDEMPOTENCY_TRIGGER] = _IDEMPOTENCY_TRIGGER_SQL
 
         def normalize(sql: str) -> str:
             normalized = "".join(sql.lower().split()).rstrip(";")
@@ -357,13 +430,22 @@ class SQLiteStore:
         if expected_version == 1:
             expected_objects = {("table", "system_events")}
             expected_table_sql = _V1_TABLE_SQL
-        elif expected_version == SCHEMA_VERSION:
+        elif expected_version == _V2_SCHEMA_VERSION:
             expected_objects = {
                 ("table", "system_events"),
                 ("trigger", _UPDATE_TRIGGER),
                 ("trigger", _DELETE_TRIGGER),
             }
             expected_table_sql = _V2_TABLE_SQL
+        elif expected_version == SCHEMA_VERSION:
+            expected_objects = {
+                ("table", "system_events"),
+                ("trigger", _UPDATE_TRIGGER),
+                ("trigger", _DELETE_TRIGGER),
+                ("trigger", _IDEMPOTENCY_TRIGGER),
+                ("index", _IDEMPOTENCY_INDEX),
+            }
+            expected_table_sql = _V3_TABLE_SQL
         else:
             raise StorageError(f"Unsupported schema version {expected_version}.")
 
@@ -393,6 +475,8 @@ class SQLiteStore:
             ("occurred_at_utc", "TEXT", 1, 0),
             ("payload_json", "TEXT", 1, 0),
         ]
+        if expected_version == SCHEMA_VERSION:
+            expected_columns.append(("idempotency_key", "TEXT", 0, 0))
         actual_columns = [
             (row["name"], row["type"].upper(), row["notnull"], row["pk"])
             for row in columns
@@ -400,20 +484,26 @@ class SQLiteStore:
         if actual_columns != expected_columns:
             raise StorageError("The system_events columns are invalid.")
 
-        # There are no user-defined indexes in either supported schema.
         indexes = self._connection.execute(
             """
-            SELECT name
+            SELECT name, sql
             FROM sqlite_master
             WHERE type = 'index'
               AND tbl_name = 'system_events'
               AND name NOT LIKE 'sqlite_%'
             """
         ).fetchall()
-        if indexes:
+        if expected_version == SCHEMA_VERSION:
+            if len(indexes) != 1 or indexes[0]["name"] != _IDEMPOTENCY_INDEX:
+                raise StorageError("Database idempotency index is invalid.")
+            if self._normalize_sql(indexes[0]["sql"]) != self._normalize_sql(
+                _IDEMPOTENCY_INDEX_SQL
+            ):
+                raise StorageError("Database idempotency index definition is invalid.")
+        elif indexes:
             raise StorageError("Unexpected indexes exist on system_events.")
 
-        if expected_version == SCHEMA_VERSION:
+        if expected_version in (_V2_SCHEMA_VERSION, SCHEMA_VERSION):
             self._verify_append_only_triggers()
 
         integrity = self._connection.execute(
@@ -426,11 +516,11 @@ class SQLiteStore:
     def _schema_transaction(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
 
-    def _create_verified_v1_backup(self, database_path: Path) -> Path:
+    def _create_verified_backup(self, database_path: Path, version: int) -> Path:
         """Create and validate a consistent, retained pre-migration backup."""
 
         backup_path = database_path.with_name(
-            f"{database_path.name}.v1-backup-{uuid4().hex}.sqlite3"
+            f"{database_path.name}.v{version}-backup-{uuid4().hex}.sqlite3"
         )
         backup = None
         try:
@@ -448,7 +538,7 @@ class SQLiteStore:
                 verify.row_factory = sqlite3.Row
                 verifier = object.__new__(SQLiteStore)
                 verifier._connection = verify
-                verifier._verify_schema(expected_version=1)
+                verifier._verify_schema(expected_version=version)
             finally:
                 verify.close()
         except Exception as exc:
@@ -462,7 +552,10 @@ class SQLiteStore:
             ) from exc
         return backup_path
 
-    def _migrate_v1_to_v2(self) -> None:
+    def _create_verified_v1_backup(self, database_path: Path) -> Path:
+        return self._create_verified_backup(database_path, version=1)
+
+    def _migrate_v1_to_v3(self) -> None:
         if not hasattr(self, "_database_path") or self._database_path is None:
             raise StorageError(
                 "A durable backup is required before migrating this database."
@@ -487,6 +580,39 @@ class SQLiteStore:
             )
             self._connection.execute("DROP TABLE system_events_v1_migration")
             self._install_append_only_triggers()
+            self._connection.execute(
+                "ALTER TABLE system_events ADD COLUMN idempotency_key TEXT"
+            )
+            self._install_idempotency_protection()
+            self._connection.execute(
+                f"PRAGMA user_version = {SCHEMA_VERSION}"
+            )
+            self._verify_schema(expected_version=SCHEMA_VERSION)
+            self._connection.commit()
+        except Exception as exc:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise StorageError(
+                "Database migration failed; the original database was rolled "
+                f"back and the verified backup was retained at {backup_path}."
+            ) from exc
+
+    def _migrate_v2_to_v3(self) -> None:
+        if not hasattr(self, "_database_path") or self._database_path is None:
+            raise StorageError(
+                "A durable backup is required before migrating this database."
+            )
+
+        backup_path = self._create_verified_backup(
+            self._database_path, version=_V2_SCHEMA_VERSION
+        )
+        try:
+            self._schema_transaction(self._connection)
+            self._verify_schema(expected_version=_V2_SCHEMA_VERSION)
+            self._connection.execute(
+                "ALTER TABLE system_events ADD COLUMN idempotency_key TEXT"
+            )
+            self._install_idempotency_protection()
             self._connection.execute(
                 f"PRAGMA user_version = {SCHEMA_VERSION}"
             )
@@ -517,7 +643,10 @@ class SQLiteStore:
             )
 
         elif version == 1:
-            self._migrate_v1_to_v2()
+            self._migrate_v1_to_v3()
+
+        elif version == _V2_SCHEMA_VERSION:
+            self._migrate_v2_to_v3()
 
         else:
             self._verify_schema(expected_version=SCHEMA_VERSION)
@@ -525,14 +654,34 @@ class SQLiteStore:
     def record_event(
         self,
         event_type: str,
-        payload: Mapping[str, Any] | None = None,
+        payload: Mapping[str, Any] | None,
+        idempotency_key: str,
     ) -> int:
-        """Append one event and return its database ID."""
+        """Append or identify an event using a stable producer-scoped key.
+
+        Keys use lowercase ASCII ``producer-namespace:UUID`` form. The
+        namespace starts with a letter and contains at most 48 lowercase
+        letters, digits or hyphens. UUIDs use canonical lowercase text. The
+        complete key is at most 85 characters. Keep the same key for retries.
+        """
 
         self._ensure_open()
 
         if not isinstance(event_type, str) or not event_type.strip():
             raise ValueError("Event type cannot be empty.")
+
+        if (
+            not isinstance(idempotency_key, str)
+            or len(idempotency_key) > 85
+            or _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key) is None
+        ):
+            raise ValueError(
+                "Idempotency key must use lowercase ASCII "
+                "producer-namespace:UUID form."
+            )
+        namespace, identifier = idempotency_key.split(":", 1)
+        if len(namespace) > 48 or str(UUID(identifier)) != identifier:
+            raise ValueError("Idempotency key contains an invalid UUID.")
 
         if payload is None:
             event_payload = {}
@@ -556,24 +705,44 @@ class SQLiteStore:
                 "Event payload must contain valid JSON data."
             ) from exc
 
-        timestamp = (
-            datetime.now(timezone.utc)
-            .isoformat(timespec="microseconds")
-            .replace("+00:00", "Z")
-        )
-
         try:
             self._connection.execute("BEGIN IMMEDIATE")
+            existing = self._connection.execute(
+                """
+                SELECT event_id, event_type, payload_json
+                FROM system_events
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["event_type"] != event_type.strip()
+                    or existing["payload_json"] != payload_json
+                ):
+                    raise IdempotencyConflictError(
+                        "Idempotency key was already used for different event data."
+                    )
+                event_id = int(existing["event_id"])
+                self._connection.rollback()
+                return event_id
+
+            timestamp = (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
             cursor = self._connection.execute(
                 """
                 INSERT INTO system_events (
                     event_type,
                     occurred_at_utc,
-                    payload_json
+                    payload_json,
+                    idempotency_key
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 """,
-                (event_type.strip(), timestamp, payload_json),
+                (event_type.strip(), timestamp, payload_json, idempotency_key),
             )
             if cursor.rowcount != 1 or cursor.lastrowid is None:
                 raise StorageError(
@@ -584,12 +753,25 @@ class SQLiteStore:
             self._connection.commit()
             return event_id
 
-        except (sqlite3.Error, StorageError) as exc:
+        except BaseException as exc:
             if self._connection.in_transaction:
-                self._connection.rollback()
+                try:
+                    self._connection.rollback()
+                except sqlite3.Error as rollback_error:
+                    self._closed = True
+                    try:
+                        self._connection.close()
+                    except sqlite3.Error:
+                        pass
+                    raise StorageError(
+                        "Could not roll back event transaction; "
+                        "the storage connection was closed."
+                    ) from rollback_error
             if isinstance(exc, StorageError):
                 raise
-            raise StorageError("Could not record system event.") from exc
+            if isinstance(exc, sqlite3.Error):
+                raise StorageError("Could not record system event.") from exc
+            raise
 
     def read_events(self, limit: int = 100) -> list[StoredEvent]:
         """Read events in chronological insertion order."""
@@ -606,7 +788,8 @@ class SQLiteStore:
                     event_id,
                     event_type,
                     occurred_at_utc,
-                    payload_json
+                    payload_json,
+                    idempotency_key
                 FROM system_events
                 ORDER BY event_id ASC
                 LIMIT ?
@@ -620,6 +803,7 @@ class SQLiteStore:
                     event_type=row["event_type"],
                     occurred_at_utc=row["occurred_at_utc"],
                     payload=json.loads(row["payload_json"]),
+                    idempotency_key=row["idempotency_key"],
                 )
                 for row in rows
             ]
