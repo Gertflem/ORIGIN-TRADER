@@ -1,6 +1,7 @@
 """SQLite persistence engine for ORIGIN TRADER."""
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -11,6 +12,9 @@ import re
 import sqlite3
 from typing import Any
 from uuid import UUID, uuid4
+
+import ctypes
+from ctypes import wintypes
 
 
 SCHEMA_VERSION = 4
@@ -113,6 +117,802 @@ class IdempotencyConflictError(StorageError):
     """Raised when an idempotency key is reused for different event data."""
 
 
+# ---------------------------------------------------------------------------
+# Windows secure storage directory ACL support
+# ---------------------------------------------------------------------------
+
+if os.name == "nt":
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # --- Security information flags ---
+    OWNER_SECURITY_INFORMATION = 0x00000001
+    GROUP_SECURITY_INFORMATION = 0x00000002
+    DACL_SECURITY_INFORMATION = 0x00000004
+    SACL_SECURITY_INFORMATION = 0x00000008
+    SE_FILE_OBJECT = 1
+
+    # --- Special security information flags ---
+    PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+
+    # --- Security descriptor control flags ---
+    SE_DACL_PROTECTED = 0x1000
+
+    # --- ACE types ---
+    ACCESS_ALLOWED_ACE_TYPE = 0x0
+
+    # --- ACE inheritance flags ---
+    CONTAINER_INHERIT_ACE = 0x1
+    OBJECT_INHERIT_ACE = 0x2
+    INHERITED_ACE = 0x10
+
+    # --- Access masks ---
+    GENERIC_ALL = 0x10000000
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    GENERIC_EXECUTE = 0x20000000
+
+    DELETE = 0x00010000
+    READ_CONTROL = 0x00020000
+    WRITE_DAC = 0x00040000
+    WRITE_OWNER = 0x00080000
+    SYNCHRONIZE = 0x00100000
+
+    FILE_READ_DATA = 0x00000001
+    FILE_WRITE_DATA = 0x00000002
+    FILE_APPEND_DATA = 0x00000004
+    FILE_READ_EA = 0x00000008
+    FILE_WRITE_EA = 0x00000010
+    FILE_EXECUTE = 0x00000020
+    FILE_DELETE_CHILD = 0x00000040
+    FILE_READ_ATTRIBUTES = 0x00000080
+    FILE_WRITE_ATTRIBUTES = 0x00000100
+
+    FILE_ALL_ACCESS = (
+        DELETE
+        | FILE_READ_DATA
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_READ_EA
+        | FILE_WRITE_EA
+        | FILE_EXECUTE
+        | FILE_DELETE_CHILD
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_ATTRIBUTES
+        | READ_CONTROL
+        | WRITE_DAC
+        | WRITE_OWNER
+        | SYNCHRONIZE
+    )
+
+    # --- Well-known SID strings ---
+    SID_STRING_SYSTEM = "S-1-5-18"
+    SID_STRING_ADMINISTRATORS = "S-1-5-32-544"
+
+    # --- ACL information class for GetAclInformation ---
+    ACL_SIZE_INFORMATION_CLASS = 2
+
+    # --- Token access rights ---
+    TOKEN_QUERY = 0x0008
+
+
+    class _SID(ctypes.Structure):
+        pass
+
+
+    _PSID = ctypes.POINTER(_SID)
+
+
+    class _ACL(ctypes.Structure):
+        pass
+
+
+    _PACL = ctypes.POINTER(_ACL)
+
+
+    class _SECURITY_DESCRIPTOR(ctypes.Structure):
+        pass
+
+
+    _PSECURITY_DESCRIPTOR = ctypes.POINTER(_SECURITY_DESCRIPTOR)
+
+
+    class _ACE_HEADER(ctypes.Structure):
+        _fields_ = [
+            ("AceType", wintypes.BYTE),
+            ("AceFlags", wintypes.BYTE),
+            ("AceSize", wintypes.WORD),
+        ]
+
+
+    class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+        _fields_ = [
+            ("Header", _ACE_HEADER),
+            ("Mask", wintypes.DWORD),
+        ]
+
+
+    class _ACL_SIZE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+
+    class _TOKEN_USER(ctypes.Structure):
+        _fields_ = [("User", _PSID)]
+
+
+    class _SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", wintypes.LPVOID),
+            ("bInheritHandle", wintypes.BOOL),
+        ]
+
+
+    _LPSECURITY_ATTRIBUTES = ctypes.POINTER(_SECURITY_ATTRIBUTES)
+
+
+    # --- Function declarations ---
+    _advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(_PSID),
+        ctypes.POINTER(_PSID),
+        ctypes.POINTER(_PACL),
+        ctypes.POINTER(_PACL),
+        ctypes.POINTER(_PSECURITY_DESCRIPTOR),
+    ]
+    _advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+
+    _advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        _PSID,
+        _PSID,
+        _PACL,
+        _PACL,
+    ]
+    _advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+
+    _advapi32.GetSecurityDescriptorDacl.argtypes = [
+        _PSECURITY_DESCRIPTOR,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(_PACL),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    _advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+
+    _advapi32.GetSecurityDescriptorOwner.argtypes = [
+        _PSECURITY_DESCRIPTOR,
+        ctypes.POINTER(_PSID),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    _advapi32.GetSecurityDescriptorOwner.restype = wintypes.BOOL
+
+    _advapi32.GetSecurityDescriptorControl.argtypes = [
+        _PSECURITY_DESCRIPTOR,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+
+    _advapi32.GetAce.argtypes = [
+        _PACL,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _advapi32.GetAce.restype = wintypes.BOOL
+
+    _advapi32.GetAclInformation.argtypes = [
+        _PACL,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    _advapi32.GetAclInformation.restype = wintypes.BOOL
+
+    _advapi32.EqualSid.argtypes = [_PSID, _PSID]
+    _advapi32.EqualSid.restype = wintypes.BOOL
+
+    _advapi32.GetLengthSid.argtypes = [_PSID]
+    _advapi32.GetLengthSid.restype = wintypes.DWORD
+
+    _advapi32.CopySid.argtypes = [
+        wintypes.DWORD,
+        _PSID,
+        _PSID,
+    ]
+    _advapi32.CopySid.restype = wintypes.BOOL
+
+    _advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_PSID),
+    ]
+    _advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+
+    _advapi32.ConvertSidToStringSidW.argtypes = [
+        _PSID,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    _advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(_SECURITY_DESCRIPTOR)),
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+
+    _kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    _kernel32.LocalFree.restype = wintypes.HLOCAL
+
+    _advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    _advapi32.OpenProcessToken.restype = wintypes.BOOL
+
+    _advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+    _kernel32.GetCurrentProcess.argtypes = []
+    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    _kernel32.CreateDirectoryW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_SECURITY_ATTRIBUTES),
+    ]
+    _kernel32.CreateDirectoryW.restype = wintypes.BOOL
+
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+    class WindowsACLError(StorageError):
+        """Raised when a Windows ACL operation fails or a policy check fails."""
+
+
+    def _get_current_user_sid() -> _PSID:
+        """Return an owned SID for the current user.
+
+        The returned SID is allocated by LocalAlloc (via
+        ConvertStringSidToSidW) and remains valid after the function
+        returns. The caller owns the allocation and must free it with
+        LocalFree, typically via the ``_owned_sid`` context manager.
+        """
+        token = wintypes.HANDLE()
+        if not _advapi32.OpenProcessToken(
+            _kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)
+        ):
+            raise WindowsACLError(
+                f"OpenProcessToken failed: {ctypes.get_last_error()}"
+            )
+        try:
+            needed = wintypes.DWORD()
+            _advapi32.GetTokenInformation(
+                token, 1, None, 0, ctypes.byref(needed)
+            )
+            if needed.value == 0:
+                raise WindowsACLError(
+                    "GetTokenInformation reported zero required length"
+                )
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not _advapi32.GetTokenInformation(
+                token, 1, buffer, needed.value, ctypes.byref(needed)
+            ):
+                raise WindowsACLError(
+                    f"GetTokenInformation failed: {ctypes.get_last_error()}"
+                )
+            token_user = ctypes.cast(buffer, ctypes.POINTER(_TOKEN_USER))
+            # Convert to string while buffer is valid, then back to a
+            # LocalAlloc'd SID that survives function return.
+            sid_string = _sid_to_string(token_user.contents.User)
+            return _sid_from_string(sid_string)
+        finally:
+            _kernel32.CloseHandle(token)
+
+
+    def _sid_from_string(sid_string: str) -> _PSID:
+        """Convert a SID string to an owned SID allocated by LocalAlloc.
+
+        The caller owns the returned allocation and must free it with
+        LocalFree (see ``_owned_sid``).
+        """
+        sid_ptr = _PSID()
+        if not _advapi32.ConvertStringSidToSidW(
+            sid_string, ctypes.byref(sid_ptr)
+        ):
+            raise WindowsACLError(
+                f"ConvertStringSidToSidW({sid_string!r}) failed: "
+                f"{ctypes.get_last_error()}"
+            )
+        return sid_ptr
+
+
+    def _sid_to_string(sid_ptr: _PSID) -> str:
+        """Convert a SID pointer to its string representation."""
+        string_ptr = wintypes.LPWSTR()
+        if not _advapi32.ConvertSidToStringSidW(
+            sid_ptr, ctypes.byref(string_ptr)
+        ):
+            raise WindowsACLError(
+                f"ConvertSidToStringSidW failed: {ctypes.get_last_error()}"
+            )
+        try:
+            return string_ptr.value
+        finally:
+            _kernel32.LocalFree(string_ptr)
+
+
+    def _sid_equal(a: _PSID, b: _PSID) -> bool:
+        """Return True if two SIDs are identical."""
+        return bool(_advapi32.EqualSid(a, b))
+
+    @contextmanager
+    def _owned_sid(sid_ptr):
+        """Yield an owned LocalAlloc'd SID and free it on exit.
+
+        Ownership is explicit: a SID returned by ``_get_current_user_sid``
+        or ``_sid_from_string`` is owned by the caller and must be wrapped
+        in this context manager (or freed with ``LocalFree``) so the
+        allocation is released on success, failure and exception paths.
+        """
+        try:
+            yield sid_ptr
+        finally:
+            if sid_ptr:
+                _kernel32.LocalFree(sid_ptr)
+
+
+    def _get_security_descriptor(path: Path) -> _PSECURITY_DESCRIPTOR:
+        """Return the security descriptor for a file or directory."""
+        sd_ptr = _PSECURITY_DESCRIPTOR()
+        result = _advapi32.GetNamedSecurityInfoW(
+            str(path),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            ctypes.byref(sd_ptr),
+        )
+        if result != 0:
+            raise WindowsACLError(
+                f"GetNamedSecurityInfoW({path}) failed: {result}"
+            )
+        return sd_ptr
+
+
+    def _get_dacl_info(sd_ptr: _PSECURITY_DESCRIPTOR) -> tuple[_PACL, bool]:
+        """Extract the DACL pointer and presence flag from a security descriptor."""
+        present = wintypes.BOOL()
+        defaulted = wintypes.BOOL()
+        dacl_ptr = _PACL()
+        if not _advapi32.GetSecurityDescriptorDacl(
+            sd_ptr, ctypes.byref(present),
+            ctypes.byref(dacl_ptr), ctypes.byref(defaulted),
+        ):
+            raise WindowsACLError(
+                f"GetSecurityDescriptorDacl failed: {ctypes.get_last_error()}"
+            )
+        return dacl_ptr, bool(present.value)
+
+
+    def _get_owner_sid(sd_ptr: _PSECURITY_DESCRIPTOR) -> _PSID:
+        """Return the owner SID from a security descriptor."""
+        owner = _PSID()
+        defaulted = wintypes.BOOL()
+        if not _advapi32.GetSecurityDescriptorOwner(
+            sd_ptr, ctypes.byref(owner), ctypes.byref(defaulted)
+        ):
+            raise WindowsACLError(
+                f"GetSecurityDescriptorOwner failed: {ctypes.get_last_error()}"
+            )
+        return owner
+
+
+    def _get_descriptor_control(sd_ptr: _PSECURITY_DESCRIPTOR) -> int:
+        """Return the control flags of a security descriptor."""
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not _advapi32.GetSecurityDescriptorControl(
+            sd_ptr, ctypes.byref(control), ctypes.byref(revision)
+        ):
+            raise WindowsACLError(
+                f"GetSecurityDescriptorControl failed: {ctypes.get_last_error()}"
+            )
+        return control.value
+
+
+    def _iterate_aces(acl_ptr: _PACL):
+        """Yield (ace_type, ace_flags, mask, sid_ptr) for each ACE in a DACL."""
+        info = _ACL_SIZE_INFORMATION()
+        if not _advapi32.GetAclInformation(
+            acl_ptr,
+            ctypes.byref(info),
+            ctypes.sizeof(_ACL_SIZE_INFORMATION),
+            ACL_SIZE_INFORMATION_CLASS,
+        ):
+            raise WindowsACLError(
+                f"GetAclInformation failed: {ctypes.get_last_error()}"
+            )
+        for _index in range(info.AceCount):
+            ace_ptr = ctypes.c_void_p()
+            if not _advapi32.GetAce(
+                acl_ptr, _index, ctypes.byref(ace_ptr)
+            ):
+                raise WindowsACLError(
+                    f"GetAce({_index}) failed: {ctypes.get_last_error()}"
+                )
+            header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
+            ace = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+            # SID follows Header (4 bytes) + Mask (4 bytes) = 8 bytes
+            sid_address = ctypes.addressof(ace) + 8
+            sid_ptr = ctypes.cast(sid_address, _PSID)
+            yield header.AceType, header.AceFlags, ace.Mask, sid_ptr
+
+
+    def _check_directory_policy(
+        path: Path,
+        expected_owner_sid: _PSID,
+        system_sid: _PSID,
+        administrators_sid: _PSID,
+    ) -> None:
+        """Verify a directory's ACL exactly matches the secure storage policy.
+
+        The expected policy is derived from ``_create_secure_directory``:
+        a protected DACL owned by the current user with, for the current
+        user, SYSTEM and Administrators, one direct full-control ACE and
+        one inheritable (OI|CI) full-control ACE. Any other ACE, duplicate,
+        deny ACE, missing ACE or mask deviation is rejected.
+
+        Raises WindowsACLError on any policy violation or inspection error.
+        """
+        sd_ptr = _get_security_descriptor(path)
+        try:
+            # 1. Owner must be the current user
+            owner_sid = _get_owner_sid(sd_ptr)
+            if not _sid_equal(owner_sid, expected_owner_sid):
+                raise WindowsACLError(
+                    f"Directory {path} is owned by an unexpected account; "
+                    f"expected current user SID."
+                )
+
+            # 2. DACL must be protected (not inherited from parent)
+            control = _get_descriptor_control(sd_ptr)
+            if not (control & SE_DACL_PROTECTED):
+                raise WindowsACLError(
+                    f"Directory {path} DACL is not protected; "
+                    f"it inherits from its parent directory."
+                )
+
+            # 3. DACL must exist
+            dacl_ptr, dacl_present = _get_dacl_info(sd_ptr)
+            if not dacl_present or dacl_ptr is None:
+                raise WindowsACLError(
+                    f"Directory {path} has no DACL."
+                )
+
+            # 4. Exact ACE set: three direct full-control ACEs and three
+            #    inheritable (OI|CI) full-control ACEs, no extras.
+            inheritable_flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            expected = (
+                (expected_owner_sid, 0, FILE_ALL_ACCESS),
+                (system_sid, 0, FILE_ALL_ACCESS),
+                (administrators_sid, 0, FILE_ALL_ACCESS),
+                (expected_owner_sid, inheritable_flags, FILE_ALL_ACCESS),
+                (system_sid, inheritable_flags, FILE_ALL_ACCESS),
+                (administrators_sid, inheritable_flags, FILE_ALL_ACCESS),
+            )
+
+            actual = []
+            for ace_type, ace_flags, mask, sid_ptr in _iterate_aces(dacl_ptr):
+                if ace_type != ACCESS_ALLOWED_ACE_TYPE:
+                    raise WindowsACLError(
+                        f"Directory {path} contains a non-allowed ACE type "
+                        f"{ace_type}; only ACCESS_ALLOWED ACEs are permitted."
+                    )
+                actual.append((sid_ptr, ace_flags, mask))
+
+            if len(actual) != len(expected):
+                raise WindowsACLError(
+                    f"Directory {path} has {len(actual)} ACEs but the policy "
+                    f"requires exactly {len(expected)}."
+                )
+
+            unmatched = list(expected)
+            for sid_ptr, ace_flags, mask in actual:
+                for index, (
+                    expected_sid,
+                    expected_flags,
+                    expected_mask,
+                ) in enumerate(unmatched):
+                    if (
+                        _sid_equal(sid_ptr, expected_sid)
+                        and ace_flags == expected_flags
+                        and mask == expected_mask
+                    ):
+                        unmatched.pop(index)
+                        break
+                else:
+                    raise WindowsACLError(
+                        f"Directory {path} contains an unexpected ACE "
+                        f"(flags 0x{ace_flags:02X}, mask 0x{mask:08X})."
+                    )
+            if unmatched:
+                raise WindowsACLError(
+                    f"Directory {path} is missing a required ACE."
+                )
+        finally:
+            if sd_ptr:
+                _kernel32.LocalFree(sd_ptr)
+
+
+    def _check_file_inherits_directory(
+        file_path: Path,
+        directory_path: Path,
+        expected_owner_sid: _PSID,
+    ) -> None:
+        """Verify a file inherits its ACL from the parent directory.
+
+        When Windows propagates an inheritable ACE from a directory to a
+        child file, it transforms the ACE flags:
+          * OBJECT_INHERIT_ACE (0x1) and CONTAINER_INHERIT_ACE (0x2) are
+            cleared on the child
+          * INHERITED_ACE (0x10) is set on the child
+          * The access mask and SID are preserved
+
+        Checks that:
+        - The file owner matches the expected owner
+        - The file DACL is not protected (it inherits from parent)
+        - Every file ACE has INHERITED_ACE set and no OI/CI flags
+        - Every file ACE matches a directory inheritable ACE by SID,
+          mask, and type
+        - No unexpected, explicit, additional, missing, or mismatched ACEs
+          exist on the file
+
+        Raises WindowsACLError on any policy violation.
+        """
+        dir_sd_ptr = _get_security_descriptor(directory_path)
+        try:
+            # Collect directory's inheritable ACEs (those that apply to
+            # children)
+            dir_dacl_ptr, dir_dacl_present = _get_dacl_info(dir_sd_ptr)
+            if not dir_dacl_present or dir_dacl_ptr is None:
+                raise WindowsACLError(
+                    f"Directory {directory_path} has no DACL."
+                )
+
+            inheritable_aces = []
+            for ace_type, ace_flags, mask, sid_ptr in _iterate_aces(
+                dir_dacl_ptr
+            ):
+                if ace_type != ACCESS_ALLOWED_ACE_TYPE:
+                    raise WindowsACLError(
+                        f"Directory {directory_path} contains a non-allowed "
+                        f"ACE type."
+                    )
+                if ace_flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE):
+                    inheritable_aces.append(
+                        (ace_flags, mask, sid_ptr)
+                    )
+
+            if not inheritable_aces:
+                raise WindowsACLError(
+                    f"Directory {directory_path} has no inheritable ACEs."
+                )
+
+            # Verify the file
+            file_sd_ptr = _get_security_descriptor(file_path)
+            try:
+                # Owner check
+                owner_sid = _get_owner_sid(file_sd_ptr)
+                if not _sid_equal(owner_sid, expected_owner_sid):
+                    raise WindowsACLError(
+                        f"File {file_path} is owned by an unexpected "
+                        f"account."
+                    )
+
+                # File DACL must NOT be protected (must inherit from parent)
+                control = _get_descriptor_control(file_sd_ptr)
+                if control & SE_DACL_PROTECTED:
+                    raise WindowsACLError(
+                        f"File {file_path} DACL is protected; "
+                        f"it must inherit from parent directory."
+                    )
+
+                # Collect file ACEs
+                file_dacl_ptr, file_dacl_present = _get_dacl_info(
+                    file_sd_ptr
+                )
+                if not file_dacl_present or file_dacl_ptr is None:
+                    raise WindowsACLError(
+                        f"File {file_path} has no DACL."
+                    )
+
+                file_aces = []
+                for ace_type, ace_flags, mask, sid_ptr in _iterate_aces(
+                    file_dacl_ptr
+                ):
+                    if ace_type != ACCESS_ALLOWED_ACE_TYPE:
+                        raise WindowsACLError(
+                            f"File {file_path} contains a non-allowed ACE "
+                            f"type."
+                        )
+                    # Explicit ACEs (no INHERITED_ACE flag) are not allowed
+                    # on files — all file ACEs must be inherited
+                    if not (ace_flags & INHERITED_ACE):
+                        raise WindowsACLError(
+                            f"File {file_path} has an explicit ACE not "
+                            f"inherited from directory policy."
+                        )
+                    # Windows clears OI/CI inheritance flags on child objects;
+                    # their presence on a file ACE is unexpected
+                    if ace_flags & (
+                        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                    ):
+                        raise WindowsACLError(
+                            f"File {file_path} has an inherited ACE with "
+                            f"unexpected inheritance flags 0x{ace_flags:02X}."
+                        )
+                    file_aces.append((ace_flags, mask, sid_ptr))
+
+                # Count check: file ACE count must equal directory
+                # inheritable ACE count
+                if len(file_aces) != len(inheritable_aces):
+                    raise WindowsACLError(
+                        f"File {file_path} has {len(file_aces)} ACEs but "
+                        f"directory policy defines {len(inheritable_aces)} "
+                        f"inheritable ACEs."
+                    )
+
+                # Track which directory ACEs have been matched to detect
+                # extra or missing ACEs
+                matched_dir = [False] * len(inheritable_aces)
+
+                # Each file ACE must match a directory inheritable ACE by
+                # SID, mask, and type
+                for file_ace_flags, file_mask, file_sid in file_aces:
+                    matched = False
+                    for dir_index, (
+                        dir_flags,
+                        dir_mask,
+                        dir_sid,
+                    ) in enumerate(inheritable_aces):
+                        if matched_dir[dir_index]:
+                            continue
+                        if (
+                            _sid_equal(file_sid, dir_sid)
+                            and file_mask == dir_mask
+                        ):
+                            matched_dir[dir_index] = True
+                            matched = True
+                            break
+                    if not matched:
+                        raise WindowsACLError(
+                            f"File {file_path} has an ACE not present in "
+                            f"directory inheritable policy."
+                        )
+
+                # All directory inheritable ACEs must be matched
+                for dir_index, was_matched in enumerate(matched_dir):
+                    if not was_matched:
+                        _, dir_mask, dir_sid = inheritable_aces[dir_index]
+                        dir_sid_str = _sid_to_string(dir_sid)
+                        raise WindowsACLError(
+                            f"File {file_path} is missing inherited ACE "
+                            f"for SID {dir_sid_str} with mask "
+                            f"0x{dir_mask:08X}."
+                        )
+            finally:
+                if file_sd_ptr:
+                    _kernel32.LocalFree(file_sd_ptr)
+        finally:
+            if dir_sd_ptr:
+                _kernel32.LocalFree(dir_sd_ptr)
+
+
+    def _create_secure_directory(path: Path) -> None:
+        """Create a directory atomically with a restrictive protected DACL.
+
+        The complete security descriptor (protected DACL with owner and
+        ACEs for the current user, SYSTEM, and Administrators) is supplied
+        to CreateDirectoryW through a SECURITY_ATTRIBUTES structure. The
+        directory is never created without its ACLs -- there is no
+        create-then-repair window.
+
+        If the directory already exists, its ACL is verified against
+        policy (owner, protected DACL flag, ACE set). Existing directories
+        are never silently repaired or modified.
+
+        Raises WindowsACLError if creation or verification fails.
+        """
+        path_str = str(path)
+
+        with (
+            _owned_sid(_get_current_user_sid()) as user_sid,
+            _owned_sid(_sid_from_string(SID_STRING_SYSTEM)) as system_sid,
+            _owned_sid(
+                _sid_from_string(SID_STRING_ADMINISTRATORS)
+            ) as administrators_sid,
+        ):
+            # Build complete SDDL with protected DACL:
+            #   O:<user>        = owner is the current user
+            #   D:P             = DACL is protected (no inheritance from parent)
+            #   (A;;FA;;;<sid>) = direct full access on the directory itself
+            #   (A;OICI;FA;;;<sid>) = inheritable full access for child objects
+            user_sid_str = _sid_to_string(user_sid)
+            sddl = (
+                f"O:{user_sid_str}"
+                f"D:P"
+                f"(A;;FA;;;{user_sid_str})"
+                f"(A;;FA;;;{SID_STRING_SYSTEM})"
+                f"(A;;FA;;;{SID_STRING_ADMINISTRATORS})"
+                f"(A;OICI;FA;;;{user_sid_str})"
+                f"(A;OICI;FA;;;{SID_STRING_SYSTEM})"
+                f"(A;OICI;FA;;;{SID_STRING_ADMINISTRATORS})"
+            )
+
+            sd_ptr = ctypes.POINTER(_SECURITY_DESCRIPTOR)()
+            sd_size = wintypes.ULONG()
+            if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(sd_ptr), ctypes.byref(sd_size)
+            ):
+                raise WindowsACLError(
+                    "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: "
+                    f"{ctypes.get_last_error()}"
+                )
+
+            try:
+                # Build SECURITY_ATTRIBUTES for atomic secure creation
+                sa = _SECURITY_ATTRIBUTES()
+                sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+                sa.lpSecurityDescriptor = ctypes.cast(sd_ptr, wintypes.LPVOID)
+                sa.bInheritHandle = False
+
+                try:
+                    if not _kernel32.CreateDirectoryW(
+                        path_str, ctypes.byref(sa)
+                    ):
+                        error = ctypes.get_last_error()
+                        if error == 183:  # ERROR_ALREADY_EXISTS
+                            _check_directory_policy(
+                                path, user_sid, system_sid, administrators_sid
+                            )
+                            return
+                        raise WindowsACLError(
+                            f"CreateDirectoryW({path_str}) failed: {error}"
+                        )
+                except WindowsACLError:
+                    raise
+                except OSError as exc:
+                    raise WindowsACLError(
+                        f"CreateDirectoryW({path_str}) failed: {exc}"
+                    ) from exc
+
+                # Verify the atomically created directory matches policy
+                _check_directory_policy(
+                    path, user_sid, system_sid, administrators_sid
+                )
+            finally:
+                if sd_ptr:
+                    _kernel32.LocalFree(sd_ptr)
+
+
 @dataclass(frozen=True, slots=True)
 class StoredEvent:
     event_id: int
@@ -157,9 +957,28 @@ class SQLiteStore:
         self._migration_reservation_active = False
 
         try:
+            if os.name == "nt":
+                # Verify directory security policy BEFORE SQLite opens or
+                # creates any database files. An insecure directory must
+                # fail closed.
+                with (
+                    _owned_sid(_get_current_user_sid()) as user_sid,
+                    _owned_sid(
+                        _sid_from_string(SID_STRING_SYSTEM)
+                    ) as system_sid,
+                    _owned_sid(
+                        _sid_from_string(SID_STRING_ADMINISTRATORS)
+                    ) as administrators_sid,
+                ):
+                    _check_directory_policy(
+                        path.parent, user_sid, system_sid, administrators_sid
+                    )
+
             self._connection = self._connect_existing(path)
             self._configure_connection()
             self._initialize_schema()
+            if os.name == "nt":
+                self._verify_windows_storage_acls()
 
         except DatabaseMissingError as exc:
             self._close_failed_connection(exc)
@@ -180,6 +999,35 @@ class SQLiteStore:
         except BaseException as exc:
             self._close_failed_connection(exc)
             raise
+
+    def _verify_windows_storage_acls(self) -> None:
+        """Verify Windows ACLs for the storage files.
+
+        Called after a store is opened. Checks that the database file and
+        any WAL/SHM sidecar files inherit the parent directory's protection.
+        ACL inspection errors fail closed.
+        """
+        if not os.name == "nt":
+            return
+        if self._database_path is None:
+            return
+        directory = self._database_path.parent
+
+        with _owned_sid(_get_current_user_sid()) as user_sid:
+            # Verify the database file inherits the directory's protection
+            _check_file_inherits_directory(
+                self._database_path, directory, user_sid
+            )
+
+            # Verify WAL and SHM sidecar files inherit protection (if present)
+            for sidecar in (
+                Path(str(self._database_path) + "-wal"),
+                Path(str(self._database_path) + "-shm"),
+            ):
+                if sidecar.exists():
+                    _check_file_inherits_directory(
+                        sidecar, directory, user_sid
+                    )
 
     @staticmethod
     def _connect_existing(path: Path) -> sqlite3.Connection:
@@ -332,7 +1180,28 @@ class SQLiteStore:
 
         path = Path(raw_path)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                # Create the directory atomically with secure ACLs if it does
+                # not yet exist, then verify the complete directory policy
+                # before any database file is created or opened. This covers
+                # pre-existing directories too: initialize() constructs the
+                # store directly and does not go through __init__().
+                with (
+                    _owned_sid(_get_current_user_sid()) as user_sid,
+                    _owned_sid(
+                        _sid_from_string(SID_STRING_SYSTEM)
+                    ) as system_sid,
+                    _owned_sid(
+                        _sid_from_string(SID_STRING_ADMINISTRATORS)
+                    ) as administrators_sid,
+                ):
+                    if not path.parent.exists():
+                        _create_secure_directory(path.parent)
+                    _check_directory_policy(
+                        path.parent, user_sid, system_sid, administrators_sid
+                    )
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
             path = path.resolve()
             descriptor = os.open(
                 path,
@@ -340,6 +1209,11 @@ class SQLiteStore:
                 0o600,
             )
             os.close(descriptor)
+            if os.name == "nt":
+                with _owned_sid(_get_current_user_sid()) as user_sid:
+                    _check_file_inherits_directory(
+                        path, path.parent, user_sid
+                    )
         except FileExistsError as exc:
             raise StorageError(
                 f"Database already exists; refusing to initialize or overwrite: {path}"
@@ -1046,6 +1920,13 @@ class SQLiteStore:
             source = None
 
             self._assert_backup_sidecars(backup_path)
+            # Verify Windows ACL inheritance BEFORE publishing VERIFIED.
+            # A backup with incorrect ACLs must never be marked VERIFIED.
+            if os.name == "nt":
+                with _owned_sid(_get_current_user_sid()) as user_sid:
+                    _check_file_inherits_directory(
+                        backup_path, backup_path.parent, user_sid
+                    )
             manifest["status"] = "VERIFIED"
             manifest["verification_utc"] = (
                 datetime.now(timezone.utc)

@@ -7,16 +7,23 @@ modified, repaired or deleted. The inventory itself is strictly read-only
 and the read-only test asserts this with before/after hashes and metadata.
 """
 
+import ctypes
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
+from origin_trader.storage import backup_inventory
 from origin_trader.storage.backup_inventory import (
     STATUS_INCOMPLETE,
     STATUS_INVALID,
@@ -997,6 +1004,818 @@ class BackupInventoryReadOnlyTests(unittest.TestCase):
             results = inventory_backups(self.directory)
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0].status, STATUS_VERIFIED)
+
+
+# ---------------------------------------------------------------------------
+# Read-access and sharing-mode regression tests (M-2I.4.56 / M-2I.4.57)
+#
+# The production Windows content-reading path must keep requesting
+# GENERIC_READ with FILE_SHARE_READ only, keep the same handle open for the
+# complete content read, and never fall back to attribute-only access.
+# The tests below are deterministic: mocked tests run everywhere, while the
+# real effective-access and concurrent-sharing tests run only on Windows/NTFS.
+# ---------------------------------------------------------------------------
+
+# Windows API constants mirrored from backup_inventory.py. The production
+# values are pinned separately on Windows.
+GENERIC_READ = 0x80000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+DELETE = 0x00010000
+SYNCHRONIZE = 0x00100000
+FILE_READ_DATA = 0x00000001
+FILE_WRITE_DATA = 0x00000002
+FILE_APPEND_DATA = 0x00000004
+FILE_WRITE_EA = 0x00000010
+FILE_WRITE_ATTRIBUTES = 0x00000100
+FILE_READ_ATTRIBUTES = 0x00000080
+INVALID_HANDLE_VALUES = (-1, 0, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+ERROR_SHARING_VIOLATION = 32
+
+
+class _FakeByHandleFileInformation(ctypes.Structure):
+    _fields_ = [("dwFileAttributes", ctypes.c_uint)]
+
+
+class _FakeWindowsHarness:
+    """In-memory Windows API surface for deterministic read-access tests.
+
+    This is a controlled mock, not a real Windows integration test. It records
+    every API call so the tests can assert the exact requested access, share
+    mode, call count and handle ownership.
+    """
+
+    def __init__(
+        self,
+        *,
+        attributes=FILE_ATTRIBUTE_NORMAL,
+        info_attributes=FILE_ATTRIBUTE_NORMAL,
+        info_success=True,
+        create_failures=0,
+        create_error=INVALID_HANDLE_VALUES[-1],
+        read_blocks=None,
+        read_error=None,
+    ):
+        self.attributes = attributes
+        self.info_attributes = info_attributes
+        self.info_success = info_success
+        self.create_failures = create_failures
+        self.create_error = create_error
+        self.read_blocks = list(read_blocks) if read_blocks is not None else []
+        self.read_error = read_error
+        self.events = []
+        self.fd = 0xF00D
+        self.create_handle = 0x1234
+        self._create_calls = 0
+        self._read_index = 0
+
+    class _Kernel32:
+        def __init__(self, harness):
+            self._harness = harness
+
+        def GetFileAttributesW(self, path):
+            self._harness.events.append(("attributes", path))
+            return self._harness.attributes
+
+        def CreateFileW(
+            self, path, access, share, security, disposition, flags, template
+        ):
+            self._harness.events.append(
+                ("create", path, access, share, disposition, flags)
+            )
+            self._harness._create_calls += 1
+            if self._harness._create_calls <= self._harness.create_failures:
+                return self._harness.create_error
+            return self._harness.create_handle
+
+        def GetFileInformationByHandle(self, handle, info_pointer):
+            self._harness.events.append(("get_info", handle))
+            if not self._harness.info_success:
+                return 0
+            info = ctypes.cast(
+                info_pointer, ctypes.POINTER(_FakeByHandleFileInformation)
+            ).contents
+            info.dwFileAttributes = self._harness.info_attributes
+            return 1
+
+        def CloseHandle(self, handle):
+            self._harness.events.append(("close_handle", handle))
+            return 1
+
+    class _Msvcrt:
+        def __init__(self, harness):
+            self._harness = harness
+
+        def open_osfhandle(self, handle_value, flags):
+            self._harness.events.append(
+                ("open_osfhandle", handle_value, flags)
+            )
+            return self._harness.fd
+
+    class _Os:
+        name = "nt"
+        O_RDONLY = os.O_RDONLY
+
+        def __init__(self, harness):
+            self._harness = harness
+
+        def read(self, fd, size):
+            self._harness.events.append(("read", fd, size))
+            if self._harness.read_error is not None:
+                raise self._harness.read_error
+            if self._harness._read_index < len(self._harness.read_blocks):
+                block = self._harness.read_blocks[self._harness._read_index]
+                self._harness._read_index += 1
+                return block
+            return b""
+
+        def close(self, fd):
+            self._harness.events.append(("close", fd))
+
+    def patches(self):
+        return {
+            "_kernel32": self._Kernel32(self),
+            "msvcrt": self._Msvcrt(self),
+            "os": self._Os(self),
+            "ctypes": ctypes,
+            "GENERIC_READ": GENERIC_READ,
+            "FILE_SHARE_READ": FILE_SHARE_READ,
+            "OPEN_EXISTING": OPEN_EXISTING,
+            "FILE_FLAG_OPEN_REPARSE_POINT": FILE_FLAG_OPEN_REPARSE_POINT,
+            "FILE_FLAG_BACKUP_SEMANTICS": FILE_FLAG_BACKUP_SEMANTICS,
+            "INVALID_HANDLE_VALUES": INVALID_HANDLE_VALUES,
+            "FILE_ATTRIBUTE_REPARSE_POINT": FILE_ATTRIBUTE_REPARSE_POINT,
+            "FILE_ATTRIBUTE_DIRECTORY": FILE_ATTRIBUTE_DIRECTORY,
+            "BY_HANDLE_FILE_INFORMATION": _FakeByHandleFileInformation,
+        }
+
+
+def _assert_protected_open_contract(test_case, harness, fd):
+    """Assert the protected content-open contract against recorded events."""
+    creates = [event for event in harness.events if event[0] == "create"]
+    test_case.assertEqual(len(creates), 1, harness.events)
+    _, _, access, share, disposition, flags = creates[0]
+    test_case.assertEqual(access, GENERIC_READ, f"desired access {access:#x}")
+    test_case.assertEqual(share, FILE_SHARE_READ, f"share mode {share:#x}")
+    test_case.assertEqual(disposition, OPEN_EXISTING)
+    test_case.assertEqual(
+        flags, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+    )
+    opens = [event for event in harness.events if event[0] == "open_osfhandle"]
+    test_case.assertEqual(len(opens), 1, harness.events)
+    test_case.assertEqual(opens[0][1], harness.create_handle)
+    test_case.assertEqual(opens[0][2], os.O_RDONLY)
+    test_case.assertEqual(fd, harness.fd)
+    test_case.assertEqual(
+        [event for event in harness.events if event[0] == "close_handle"], []
+    )
+
+
+class WindowsApiContractTests(unittest.TestCase):
+    """Mocked Windows API contract tests (run on every platform)."""
+
+    def test_production_windows_constants_are_pinned(self):
+        if os.name != "nt":
+            self.skipTest("production Windows constants exist only on Windows")
+        for name, expected in (
+            ("GENERIC_READ", GENERIC_READ),
+            ("FILE_SHARE_READ", FILE_SHARE_READ),
+            ("OPEN_EXISTING", OPEN_EXISTING),
+            ("FILE_FLAG_OPEN_REPARSE_POINT", FILE_FLAG_OPEN_REPARSE_POINT),
+            ("FILE_FLAG_BACKUP_SEMANTICS", FILE_FLAG_BACKUP_SEMANTICS),
+            ("FILE_ATTRIBUTE_REPARSE_POINT", FILE_ATTRIBUTE_REPARSE_POINT),
+            ("FILE_ATTRIBUTE_DIRECTORY", FILE_ATTRIBUTE_DIRECTORY),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(backup_inventory, name), expected)
+        self.assertEqual(
+            backup_inventory.INVALID_HANDLE_VALUES, INVALID_HANDLE_VALUES
+        )
+
+    def test_open_requests_generic_read_share_read_only_once(self):
+        harness = _FakeWindowsHarness()
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            fd = backup_inventory._open_regular_readonly_windows(Path("dummy"))
+        _assert_protected_open_contract(self, harness, fd)
+
+    def test_open_create_failure_does_not_retry_or_weaken(self):
+        harness = _FakeWindowsHarness(create_failures=1)
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            fd = backup_inventory._open_regular_readonly_windows(Path("dummy"))
+        self.assertIsNone(fd)
+        creates = [event for event in harness.events if event[0] == "create"]
+        self.assertEqual(len(creates), 1, harness.events)
+        self.assertEqual(creates[0][2], GENERIC_READ)
+        self.assertEqual(creates[0][3], FILE_SHARE_READ)
+        self.assertEqual(
+            [event for event in harness.events if event[0] == "close_handle"], []
+        )
+
+    def test_open_info_failure_closes_handle_without_retry(self):
+        harness = _FakeWindowsHarness(info_success=False)
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            fd = backup_inventory._open_regular_readonly_windows(Path("dummy"))
+        self.assertIsNone(fd)
+        creates = [event for event in harness.events if event[0] == "create"]
+        self.assertEqual(len(creates), 1, harness.events)
+        self.assertEqual(creates[0][2], GENERIC_READ)
+        self.assertEqual(creates[0][3], FILE_SHARE_READ)
+        self.assertEqual(
+            [event for event in harness.events if event[0] == "close_handle"],
+            [("close_handle", harness.create_handle)],
+        )
+
+    def test_open_reparse_and_directory_are_rejected_without_retry(self):
+        for attributes, label in (
+            (FILE_ATTRIBUTE_REPARSE_POINT, "reparse"),
+            (FILE_ATTRIBUTE_DIRECTORY, "directory"),
+        ):
+            with self.subTest(label=label):
+                harness = _FakeWindowsHarness(attributes=attributes)
+                with patch.dict(backup_inventory.__dict__, harness.patches()):
+                    fd = backup_inventory._open_regular_readonly_windows(
+                        Path("dummy")
+                    )
+                self.assertIsNone(fd)
+                self.assertEqual(
+                    [event for event in harness.events if event[0] == "create"], []
+                )
+
+    def test_open_post_validate_directory_and_reparse_close_without_retry(self):
+        for info_attributes, label in (
+            (FILE_ATTRIBUTE_DIRECTORY, "directory"),
+            (FILE_ATTRIBUTE_REPARSE_POINT, "reparse"),
+        ):
+            with self.subTest(label=label):
+                harness = _FakeWindowsHarness(info_attributes=info_attributes)
+                with patch.dict(backup_inventory.__dict__, harness.patches()):
+                    fd = backup_inventory._open_regular_readonly_windows(
+                        Path("dummy")
+                    )
+                self.assertIsNone(fd)
+                creates = [event for event in harness.events if event[0] == "create"]
+                self.assertEqual(len(creates), 1, harness.events)
+                self.assertEqual(creates[0][2], GENERIC_READ)
+                self.assertEqual(creates[0][3], FILE_SHARE_READ)
+                self.assertEqual(
+                    [event for event in harness.events if event[0] == "close_handle"],
+                    [("close_handle", harness.create_handle)],
+                )
+
+    def test_source_does_not_reference_write_or_delete_share_flags(self):
+        source = (
+            REPO_ROOT
+            / "src"
+            / "origin_trader"
+            / "storage"
+            / "backup_inventory.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("FILE_SHARE_WRITE", source)
+        self.assertNotIn("FILE_SHARE_DELETE", source)
+
+
+class ContentReadPathContractTests(unittest.TestCase):
+    """Both content-reading paths must use the protected handle."""
+
+    def _assert_read_path_contract(self, harness, expected_order):
+        creates = [event for event in harness.events if event[0] == "create"]
+        self.assertEqual(len(creates), 1, harness.events)
+        _, _, access, share, _, _ = creates[0]
+        self.assertEqual(access, GENERIC_READ)
+        self.assertEqual(share, FILE_SHARE_READ)
+        opens = [event for event in harness.events if event[0] == "open_osfhandle"]
+        self.assertEqual(len(opens), 1, harness.events)
+        self.assertEqual(opens[0][1], harness.create_handle)
+        reads = [event for event in harness.events if event[0] == "read"]
+        self.assertTrue(reads)
+        self.assertTrue(all(read[1] == harness.fd for read in reads))
+        self.assertEqual(
+            [event for event in harness.events if event[0] == "close"],
+            [("close", harness.fd)],
+        )
+        self.assertEqual(
+            [event for event in harness.events if event[0] == "close_handle"], []
+        )
+        self.assertEqual(
+            [event[0] for event in harness.events], expected_order
+        )
+
+    def test_read_manifest_uses_protected_handle_without_reopen(self):
+        content = json.dumps({"status": STATUS_VERIFIED}).encode("utf-8")
+        harness = _FakeWindowsHarness(read_blocks=[content])
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            manifest, reason = backup_inventory._read_manifest(
+                Path("dummy.manifest.json")
+            )
+        self.assertIsNone(reason)
+        self.assertEqual(manifest, {"status": STATUS_VERIFIED})
+        self._assert_read_path_contract(
+            harness,
+            [
+                "attributes",
+                "create",
+                "get_info",
+                "open_osfhandle",
+                "read",
+                "read",
+                "close",
+            ],
+        )
+
+    def test_sha256_of_file_uses_protected_handle_without_reopen(self):
+        content = b"payload" * 10
+        harness = _FakeWindowsHarness(read_blocks=[content])
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            digest = backup_inventory._sha256_of_file(Path("dummy.sqlite3"))
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+        self._assert_read_path_contract(
+            harness,
+            [
+                "attributes",
+                "create",
+                "get_info",
+                "open_osfhandle",
+                "read",
+                "read",
+                "close",
+            ],
+        )
+
+    def test_read_manifest_read_failure_closes_descriptor_without_retry(self):
+        harness = _FakeWindowsHarness(read_error=OSError("injected read failure"))
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            with self.assertRaises(OSError):
+                backup_inventory._read_manifest(Path("dummy.manifest.json"))
+        creates = [event for event in harness.events if event[0] == "create"]
+        self.assertEqual(len(creates), 1, harness.events)
+        self.assertEqual(creates[0][2], GENERIC_READ)
+        self.assertEqual(creates[0][3], FILE_SHARE_READ)
+        self.assertEqual(
+            [event for event in harness.events if event[0] == "close"],
+            [("close", harness.fd)],
+        )
+
+    def test_sha256_of_file_read_failure_closes_descriptor_without_retry(self):
+        harness = _FakeWindowsHarness(read_error=OSError("injected read failure"))
+        with patch.dict(backup_inventory.__dict__, harness.patches()):
+            with self.assertRaises(OSError):
+                backup_inventory._sha256_of_file(Path("dummy.sqlite3"))
+        creates = [event for event in harness.events if event[0] == "create"]
+        self.assertEqual(len(creates), 1, harness.events)
+        self.assertEqual(creates[0][2], GENERIC_READ)
+        self.assertEqual(creates[0][3], FILE_SHARE_READ)
+        self.assertEqual(
+            [event for event in harness.events if event[0] == "close"],
+            [("close", harness.fd)],
+        )
+
+
+class _IO_STATUS_BLOCK_STATUS(ctypes.Union):
+    """Union of NTSTATUS and PVOID, as in the Windows IO_STATUS_BLOCK."""
+
+    _fields_ = [("Status", ctypes.c_long), ("Pointer", ctypes.c_void_p)]
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    """Pointer-aligned Windows IO_STATUS_BLOCK (native 32/64-bit layout)."""
+
+    _fields_ = [
+        ("Status", _IO_STATUS_BLOCK_STATUS),
+        ("Information", ctypes.c_size_t),
+    ]
+
+
+class _FILE_ACCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [("AccessFlags", ctypes.c_uint)]
+
+
+class IOStatusBlockAbiTests(unittest.TestCase):
+    """ABI checks for the Windows IO_STATUS_BLOCK definition."""
+
+    def test_status_union_size_equals_pointer_size(self):
+        self.assertEqual(
+            ctypes.sizeof(_IO_STATUS_BLOCK_STATUS),
+            ctypes.sizeof(ctypes.c_void_p),
+        )
+
+    def test_information_offset_equals_pointer_size(self):
+        self.assertEqual(
+            _IO_STATUS_BLOCK.Information.offset,
+            ctypes.sizeof(ctypes.c_void_p),
+        )
+
+    def test_total_size_equals_twice_pointer_size(self):
+        self.assertEqual(
+            ctypes.sizeof(_IO_STATUS_BLOCK),
+            2 * ctypes.sizeof(ctypes.c_void_p),
+        )
+
+    def test_layout_matches_current_architecture(self):
+        pointer_size = ctypes.sizeof(ctypes.c_void_p)
+        self.assertIn(pointer_size, (4, 8))
+        self.assertEqual(ctypes.alignment(_IO_STATUS_BLOCK), pointer_size)
+        self.assertEqual(
+            ctypes.sizeof(_IO_STATUS_BLOCK_STATUS), pointer_size
+        )
+        self.assertEqual(
+            ctypes.sizeof(_IO_STATUS_BLOCK), 2 * pointer_size
+        )
+        self.assertEqual(_IO_STATUS_BLOCK.Information.size, pointer_size)
+
+
+def _query_effective_access(fd):
+    """Return the granted access mask for *fd* via NtQueryInformationFile."""
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(fd)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtQueryInformationFile.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.POINTER(_FILE_ACCESS_INFORMATION),
+        ctypes.c_ulong,
+        ctypes.c_int,
+    ]
+    ntdll.NtQueryInformationFile.restype = ctypes.c_ulong
+    iosb = _IO_STATUS_BLOCK()
+    info = _FILE_ACCESS_INFORMATION()
+    status = ntdll.NtQueryInformationFile(
+        handle,
+        ctypes.byref(iosb),
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+        8,  # FileAccessInformation
+    )
+    if status != 0:
+        raise OSError(
+            f"NtQueryInformationFile(FileAccessInformation) failed: "
+            f"NTSTATUS {status:#x}"
+        )
+    return info.AccessFlags
+
+
+def _filesystem_type(path):
+    absolute = os.path.abspath(path)
+    drive = os.path.splitdrive(absolute)[0]
+    if not drive:
+        drive = os.path.splitdrive(os.getcwd())[0]
+    root = drive + "\\"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    volume_name = ctypes.create_unicode_buffer(256)
+    file_system = ctypes.create_unicode_buffer(256)
+    success = kernel32.GetVolumeInformationW(
+        root, volume_name, 256, None, None, None, file_system, 256
+    )
+    if not success:
+        raise OSError(
+            ctypes.get_last_error(), "GetVolumeInformationW failed"
+        )
+    return file_system.value
+
+
+@unittest.skipIf(os.name != "nt", "Windows effective-access tests require Windows")
+class WindowsEffectiveAccessTests(unittest.TestCase):
+    """Real Windows effective-access tests (skipped on non-Windows)."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.path = Path(self.tempdir.name) / "effective-access.sqlite3"
+        self.path.write_bytes(b"effective-access-payload" * 8)
+
+    def test_effective_access_grants_read_data_and_no_write_or_delete(self):
+        fd = backup_inventory._open_regular_readonly(self.path)
+        self.assertIsNotNone(fd)
+        try:
+            mask = _query_effective_access(fd)
+            content = os.read(fd, 16)
+        finally:
+            os.close(fd)
+        self.assertEqual(content, b"effective-access")
+        self.assertTrue(mask & FILE_READ_DATA, f"effective access {mask:#x}")
+        forbidden = (
+            FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+        )
+        self.assertEqual(mask & forbidden, 0, f"effective access {mask:#x}")
+
+    def test_read_manifest_and_sha256_paths_read_content_successfully(self):
+        manifest_path = Path(self.tempdir.name) / "artifact.manifest.json"
+        manifest_path.write_text(
+            json.dumps({"status": STATUS_VERIFIED}), encoding="utf-8"
+        )
+        manifest, reason = backup_inventory._read_manifest(manifest_path)
+        self.assertIsNone(reason)
+        self.assertEqual(manifest, {"status": STATUS_VERIFIED})
+        digest = backup_inventory._sha256_of_file(self.path)
+        self.assertEqual(
+            digest, hashlib.sha256(self.path.read_bytes()).hexdigest()
+        )
+
+
+_SHARE_PROBE_CHILD = textwrap.dedent(
+    """
+    import ctypes, json, sys
+    from ctypes import wintypes
+
+    path, mode = sys.argv[1], sys.argv[2]
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    DELETE = 0x00010000
+    FILE_SHARE_READ = 0x00000001
+    OPEN_EXISTING = 3
+
+    access = {
+        "read": GENERIC_READ,
+        "write": GENERIC_WRITE,
+        "delete": DELETE,
+    }[mode]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateFileW(
+        path, access, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None
+    )
+    if handle is None or int(handle) in (-1, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF):
+        print(json.dumps({
+            "mode": mode, "result": "failure", "error": ctypes.get_last_error()
+        }))
+    else:
+        kernel32.CloseHandle(handle)
+        print(json.dumps({"mode": mode, "result": "success", "error": 0}))
+    """
+).lstrip()
+
+
+@unittest.skipIf(os.name != "nt", "Windows sharing tests require Windows")
+class WindowsReadOnlySharingIntegrationTests(unittest.TestCase):
+    """Real Windows local-NTFS concurrent-access tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file_system = _filesystem_type(tempfile.gettempdir())
+        if cls.file_system.upper() != "NTFS":
+            raise unittest.SkipTest(
+                "filesystem-specific sharing tests require NTFS; "
+                f"volume is {cls.file_system}"
+            )
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.path = Path(self.tempdir.name) / "protected.sqlite3"
+        self.path.write_bytes(b"inventory-payload" * 8)
+
+    def _probe(self, path, mode):
+        result = subprocess.run(
+            [sys.executable, "-c", _SHARE_PROBE_CHILD, str(path), mode],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_concurrent_read_open_succeeds(self):
+        fd = backup_inventory._open_regular_readonly(self.path)
+        self.assertIsNotNone(fd)
+        try:
+            probe = self._probe(self.path, "read")
+            self.assertEqual(probe["result"], "success", probe)
+        finally:
+            os.close(fd)
+
+    def test_write_open_is_sharing_violation_while_handle_open(self):
+        fd = backup_inventory._open_regular_readonly(self.path)
+        self.assertIsNotNone(fd)
+        try:
+            control = self._probe(self.path, "read")
+            self.assertEqual(control["result"], "success", control)
+            probe = self._probe(self.path, "write")
+            self.assertEqual(probe["result"], "failure", probe)
+            self.assertEqual(
+                probe["error"], ERROR_SHARING_VIOLATION, probe
+            )
+            self.assertEqual(os.read(fd, 16), b"inventory-payloa")
+        finally:
+            os.close(fd)
+        after = self._probe(self.path, "write")
+        self.assertEqual(after["result"], "success", after)
+
+    def test_delete_open_is_sharing_violation_while_handle_open(self):
+        fd = backup_inventory._open_regular_readonly(self.path)
+        self.assertIsNotNone(fd)
+        try:
+            control = self._probe(self.path, "read")
+            self.assertEqual(control["result"], "success", control)
+            probe = self._probe(self.path, "delete")
+            self.assertEqual(probe["result"], "failure", probe)
+            self.assertEqual(
+                probe["error"], ERROR_SHARING_VIOLATION, probe
+            )
+        finally:
+            os.close(fd)
+        after = self._probe(self.path, "delete")
+        self.assertEqual(after["result"], "success", after)
+
+    def test_handle_remains_protected_during_content_read(self):
+        fd = backup_inventory._open_regular_readonly(self.path)
+        self.assertIsNotNone(fd)
+        try:
+            while True:
+                block = os.read(fd, 1024 * 1024)
+                if not block:
+                    break
+                probe = self._probe(self.path, "write")
+                self.assertEqual(probe["result"], "failure", probe)
+                self.assertEqual(
+                    probe["error"], ERROR_SHARING_VIOLATION, probe
+                )
+        finally:
+            os.close(fd)
+
+    def test_inventory_success_closes_handle(self):
+        backup_path = _make_backup_fixture(
+            Path(self.tempdir.name), "alpha.sqlite3"
+        )
+        results = inventory_backups(self.tempdir.name)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, STATUS_VERIFIED)
+        for mode in ("write", "delete"):
+            with self.subTest(mode=mode):
+                probe = self._probe(backup_path, mode)
+                self.assertEqual(probe["result"], "success", probe)
+
+    def test_inventory_failure_path_closes_handle(self):
+        backup_path = _make_backup_fixture(
+            Path(self.tempdir.name), "alpha.sqlite3"
+        )
+        manifest_path = backup_path.with_name(
+            backup_path.name + ".manifest.json"
+        )
+        manifest_path.write_text("{ not valid json", encoding="utf-8")
+        results = inventory_backups(self.tempdir.name)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, STATUS_INVALID)
+        for mode in ("write", "delete"):
+            with self.subTest(mode=mode):
+                probe = self._probe(backup_path, mode)
+                self.assertEqual(probe["result"], "success", probe)
+
+
+_CREATE_CALL = (
+    "        hFile = _kernel32.CreateFileW(\n"
+    "            str(path),\n"
+    "            GENERIC_READ,\n"
+    "            FILE_SHARE_READ,\n"
+    "            None,\n"
+    "            OPEN_EXISTING,\n"
+    "            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,\n"
+    "            None,\n"
+    "        )"
+)
+
+_VALIDATION_BLOCK = (
+    "        info = BY_HANDLE_FILE_INFORMATION()\n"
+    "        if not _kernel32.GetFileInformationByHandle(\n"
+    "            hFile, ctypes.byref(info)\n"
+    "        ):\n"
+    "            return None\n"
+    "        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY:\n"
+    "            return None\n"
+    "        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:\n"
+    "            return None\n"
+    "\n"
+    "        fd = msvcrt.open_osfhandle(handle_value, os.O_RDONLY)\n"
+    "        handle_owned = False  # ownership transferred to fd\n"
+    "        return fd"
+)
+
+_CLOSE_REOPEN_BLOCK = (
+    "        _kernel32.CloseHandle(hFile)\n"
+    "        handle_owned = False\n"
+    "        hFile = _kernel32.CreateFileW(\n"
+    "            str(path),\n"
+    "            GENERIC_READ,\n"
+    "            FILE_SHARE_READ,\n"
+    "            None,\n"
+    "            OPEN_EXISTING,\n"
+    "            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,\n"
+    "            None,\n"
+    "        )\n"
+    "        handle_value = int(hFile)\n"
+    "        fd = msvcrt.open_osfhandle(handle_value, os.O_RDONLY)\n"
+    "        return fd"
+)
+
+_RETRY_FALLBACK_BLOCK = (
+    "\n"
+    "        if int(hFile) in INVALID_HANDLE_VALUES:\n"
+    "            hFile = _kernel32.CreateFileW(\n"
+    "                str(path),\n"
+    "                0x00000080 | 0x00100000,\n"
+    "                FILE_SHARE_READ,\n"
+    "                None,\n"
+    "                OPEN_EXISTING,\n"
+    "                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,\n"
+    "                None,\n"
+    "            )"
+)
+
+_MUTATIONS = {
+    "attribute_only": [(_CREATE_CALL, _CREATE_CALL.replace(
+        "            GENERIC_READ,\n", "            0x00000080 | 0x00100000,\n"
+    ))],
+    "share_write": [(_CREATE_CALL, _CREATE_CALL.replace(
+        "            FILE_SHARE_READ,\n", "            FILE_SHARE_READ | 0x00000002,\n"
+    ))],
+    "share_delete": [(_CREATE_CALL, _CREATE_CALL.replace(
+        "            FILE_SHARE_READ,\n", "            FILE_SHARE_READ | 0x00000004,\n"
+    ))],
+    "share_none": [(_CREATE_CALL, _CREATE_CALL.replace(
+        "            FILE_SHARE_READ,\n", "            0,\n"
+    ))],
+    "retry_fallback": [(_CREATE_CALL, _CREATE_CALL + _RETRY_FALLBACK_BLOCK)],
+    "close_reopen": [(_VALIDATION_BLOCK, _CLOSE_REOPEN_BLOCK)],
+}
+
+
+class RegressionSensitivityTests(unittest.TestCase):
+    """Each mutation must be detected by the protected-open contract."""
+
+    def _load_mutated_module(self, replacements):
+        source_path = (
+            REPO_ROOT
+            / "src"
+            / "origin_trader"
+            / "storage"
+            / "backup_inventory.py"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        mutated = source
+        for old, new in replacements:
+            self.assertEqual(
+                mutated.count(old),
+                1,
+                f"mutation anchor not unique: {old[:80]!r}",
+            )
+            mutated = mutated.replace(old, new)
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        module_path = Path(temp_dir) / "backup_inventory_mutated.py"
+        module_path.write_text(mutated, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "backup_inventory_mutated", module_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _assert_mutation_is_detected(self, replacements, *, create_failures=0):
+        module = self._load_mutated_module(replacements)
+        harness = _FakeWindowsHarness(create_failures=create_failures)
+        with patch.dict(module.__dict__, harness.patches()):
+            fd = module._open_regular_readonly_windows(Path("dummy"))
+        with self.assertRaises(AssertionError):
+            _assert_protected_open_contract(self, harness, fd)
+
+    def test_attribute_only_mutation_is_detected(self):
+        self._assert_mutation_is_detected(_MUTATIONS["attribute_only"])
+
+    def test_share_write_mutation_is_detected(self):
+        self._assert_mutation_is_detected(_MUTATIONS["share_write"])
+
+    def test_share_delete_mutation_is_detected(self):
+        self._assert_mutation_is_detected(_MUTATIONS["share_delete"])
+
+    def test_share_none_mutation_is_detected(self):
+        self._assert_mutation_is_detected(_MUTATIONS["share_none"])
+
+    def test_retry_fallback_mutation_is_detected(self):
+        self._assert_mutation_is_detected(
+            _MUTATIONS["retry_fallback"], create_failures=1
+        )
+
+    def test_close_reopen_mutation_is_detected(self):
+        self._assert_mutation_is_detected(_MUTATIONS["close_reopen"])
 
 
 if __name__ == "__main__":

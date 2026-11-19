@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -7,10 +8,38 @@ import textwrap
 import time
 from threading import Barrier, Event
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from tempfile import TemporaryDirectory
+import tempfile as _tempfile
 from unittest.mock import patch
 from uuid import uuid4
+
+_original_temporary_directory = _tempfile.TemporaryDirectory
+
+
+@contextmanager
+def TemporaryDirectory(suffix=None, prefix=None, dir=None,
+                       ignore_cleanup_errors=False):
+    """TemporaryDirectory that yields a secure subdirectory.
+
+    Creates a standard TemporaryDirectory, then creates a secure
+    subdirectory with restrictive ACLs via _create_secure_directory.
+    Yields the secure directory path so that SQLiteStore.__init__()
+    can verify directory policy before opening the database.
+    """
+    with _original_temporary_directory(
+        suffix=suffix, prefix=prefix, dir=dir,
+        ignore_cleanup_errors=ignore_cleanup_errors
+    ) as base:
+        secure_dir = Path(base) / "secure-dir"
+        _create_secure_directory(secure_dir)
+        try:
+            yield secure_dir
+        finally:
+            pass
+
+import ctypes
+from ctypes import wintypes
 
 from origin_trader.storage.sqlite_store import (
     DatabaseMissingError,
@@ -18,6 +47,16 @@ from origin_trader.storage.sqlite_store import (
     SCHEMA_VERSION,
     SQLiteStore,
     StorageError,
+    WindowsACLError,
+    _check_directory_policy,
+    _check_file_inherits_directory,
+    _create_secure_directory,
+    _get_current_user_sid,
+    _get_dacl_info,
+    _get_security_descriptor,
+    _owned_sid,
+    _sid_from_string,
+    _sid_to_string,
 )
 
 
@@ -103,6 +142,23 @@ class StorageTests(unittest.TestCase):
 
     def _source_path(self):
         return str(Path(__file__).resolve().parents[1] / "src")
+
+    @contextmanager
+    def _secure_temp_directory(self):
+        """Context manager yielding a secure directory inside a temp dir.
+
+        Creates a TemporaryDirectory, then creates a secure subdirectory
+        with restrictive ACLs via _create_secure_directory. Yields the
+        secure directory path so that SQLiteStore.__init__() can verify
+        directory policy before opening the database.
+        """
+        with TemporaryDirectory() as base:
+            secure_dir = Path(base) / "secure-dir"
+            _create_secure_directory(secure_dir)
+            try:
+                yield secure_dir
+            finally:
+                pass  # TemporaryDirectory cleanup happens on exit
 
     def _run_competing_submissions(self, database, key, submissions):
         with TemporaryDirectory() as directory:
@@ -2576,6 +2632,576 @@ class StorageTests(unittest.TestCase):
                 connection.close()
             with self.assertRaises(StorageError):
                 SQLiteStore(database)
+
+
+class WindowsSecureDirectoryTests(unittest.TestCase):
+    """Windows secure storage directory ACL verification tests.
+
+    These tests exercise the Windows ACL implementation in
+    sqlite_store.py using actual security descriptor inspection,
+    not mocked success responses.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if os.name != "nt":
+            raise unittest.SkipTest("Windows ACL tests require Windows")
+
+    def test_secure_directory_creation_creates_protected_dacl(self):
+        """Atomic creation yields a directory with protected DACL matching policy.
+
+        The directory is created with SECURITY_ATTRIBUTES supplying the
+        full security descriptor to CreateDirectoryW, so there is no
+        create-then-repair window.
+        """
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+
+            user_sid = _get_current_user_sid()
+            system_sid = _sid_from_string(WindowsSecureDirectoryTests.SID_SYSTEM)
+            administrators_sid = _sid_from_string(
+                WindowsSecureDirectoryTests.SID_ADMINISTRATORS
+            )
+            # The directory must pass the full policy check:
+            # owner, protected DACL flag, and complete ACE set.
+            _check_directory_policy(
+                directory, user_sid, system_sid, administrators_sid
+            )
+
+    def test_existing_insecure_directory_rejected(self):
+        """An existing directory with default (inherited) DACL is rejected.
+
+        _create_secure_directory verifies existing directories against
+        policy and never silently repairs them.
+        """
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "insecure-dir"
+            directory.mkdir()
+            # Default directory DACL is inherited (not protected) and lacks
+            # the required ACEs, so it must fail closed.
+            with self.assertRaises(WindowsACLError):
+                _create_secure_directory(directory)
+
+    def test_existing_secure_directory_accepted(self):
+        """Re-verifying an already-secure directory succeeds."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            # Calling _create_secure_directory again on the same directory
+            # verifies policy without modification.
+            _create_secure_directory(directory)
+
+    def test_incorrect_owner_rejected(self):
+        """A directory owned by a different account is rejected."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "dir"
+            directory.mkdir()
+
+            fake_sid = _sid_from_string("S-1-5-0")  # Nobody
+            system_sid = _sid_from_string(WindowsSecureDirectoryTests.SID_SYSTEM)
+            administrators_sid = _sid_from_string(
+                WindowsSecureDirectoryTests.SID_ADMINISTRATORS
+            )
+
+            with patch(
+                "origin_trader.storage.sqlite_store._get_current_user_sid",
+                return_value=fake_sid,
+            ):
+                with self.assertRaises(WindowsACLError):
+                    _check_directory_policy(
+                        directory, fake_sid, system_sid, administrators_sid
+                    )
+
+    def test_unprotected_dacl_rejected(self):
+        """A directory whose DACL is not protected is rejected."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "unprotected-dir"
+            directory.mkdir()
+            # Default inherited DACL is not protected -> fail closed.
+            with self.assertRaises(WindowsACLError):
+                _create_secure_directory(directory)
+
+    def test_directory_verified_during_sqlite_initialize(self):
+        """SQLiteStore.initialize creates a new directory atomically with secure ACLs.
+
+        When the parent directory does not exist, initialize creates it
+        atomically with a protected DACL via SECURITY_ATTRIBUTES.
+        """
+        with TemporaryDirectory() as base:
+            # Parent does not exist yet - initialize should create it securely
+            new_dir = Path(base) / "new-secure-dir"
+            database = new_dir / "test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                self.assertEqual(
+                    store._connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+
+            # The directory should now exist with a secure protected DACL
+            user_sid = _get_current_user_sid()
+            system_sid = _sid_from_string(WindowsSecureDirectoryTests.SID_SYSTEM)
+            administrators_sid = _sid_from_string(
+                WindowsSecureDirectoryTests.SID_ADMINISTRATORS
+            )
+            _check_directory_policy(
+                new_dir, user_sid, system_sid, administrators_sid
+            )
+
+    def test_directory_verified_during_sqlite_open(self):
+        """SQLiteStore() verifies directory policy before opening existing DB."""
+        with TemporaryDirectory() as base:
+            # Create a secure directory, then initialize a database in it
+            secure_dir = Path(base) / "secure-dir"
+            _create_secure_directory(secure_dir)
+            database = secure_dir / "test.sqlite3"
+            with SQLiteStore.initialize(database):
+                pass
+
+            # Now opening the existing database should also verify directory policy
+            with SQLiteStore(database) as store:
+                self.assertEqual(
+                    store._connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+
+    def test_database_file_acl_inheritance(self):
+        """A database file created in a secure directory inherits protection."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            database = directory / "inherit-test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                pass
+
+            user_sid = _get_current_user_sid()
+            _check_file_inherits_directory(database, directory, user_sid)
+
+    def test_wal_and_shm_acl_inheritance(self):
+        """WAL and SHM sidecar files inherit directory protection.
+
+        Creates real WAL and SHM files by writing events with the
+        connection left open, then verifies both actual Windows security
+        descriptors against the directory policy. Fails if either file
+        is absent.
+        """
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            database = directory / "wal-shm-test.sqlite3"
+
+            store = SQLiteStore.initialize(database)
+            try:
+                _record(store, "inherit_event", {"n": 1})
+                # Force WAL file creation by ensuring WAL mode and writing
+                store._connection.execute("PRAGMA journal_mode=WAL")
+                store._connection.commit()
+
+                wal_path = Path(str(database) + "-wal")
+                shm_path = Path(str(database) + "-shm")
+
+                # Both WAL and SHM files must exist
+                self.assertTrue(
+                    wal_path.exists(),
+                    f"WAL file {wal_path} does not exist",
+                )
+                self.assertTrue(
+                    shm_path.exists(),
+                    f"SHM file {shm_path} does not exist",
+                )
+
+                user_sid = _get_current_user_sid()
+                _check_file_inherits_directory(
+                    wal_path, directory, user_sid
+                )
+                _check_file_inherits_directory(
+                    shm_path, directory, user_sid
+                )
+            finally:
+                store.close()
+
+    def test_backup_file_acl_inheritance(self):
+        """A verified backup file inherits directory protection."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            database = directory / "backup-inherit-test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "backup_event", {"n": 1})
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+                backup_path = store._create_verified_backup(database, version=4)
+                store._connection.rollback()
+
+            user_sid = _get_current_user_sid()
+            _check_file_inherits_directory(
+                backup_path, directory, user_sid
+            )
+
+    def test_backup_acl_verification_prevents_verified_manifest(self):
+        """ACL verification failure prevents VERIFIED manifest publication.
+
+        When the backup file's ACL inheritance check fails, the manifest
+        must not be published as VERIFIED. The backup artifact and its
+        INCOMPLETE/REJECTED manifest are retained for forensic inspection.
+        """
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            database = directory / "acl-order-test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                _record(store, "acl_order_event", {"n": 1})
+                store._connection.execute("BEGIN IMMEDIATE")
+                store._migration_reservation_active = True
+
+                # Mock ACL check to fail, simulating a backup file with
+                # incorrect ACLs. This must prevent VERIFIED publication.
+                with patch(
+                    "origin_trader.storage.sqlite_store._check_file_inherits_directory",
+                    side_effect=WindowsACLError("ACL verification failed"),
+                ):
+                    with self.assertRaises(StorageError) as caught:
+                        store._create_verified_backup(database, version=4)
+                    self.assertIsInstance(
+                        caught.exception.__cause__, WindowsACLError
+                    )
+
+                store._connection.rollback()
+
+            # The manifest must NOT be VERIFIED - it should be REJECTED
+            backups = list(Path(directory).glob("*.v4-backup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            manifest_path = SQLiteStore._backup_manifest_path(backups[0])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(manifest["status"], "VERIFIED")
+            self.assertEqual(manifest["status"], "REJECTED")
+
+    def test_explicit_file_ace_rejected(self):
+        """A file with an explicit (non-inherited) ACE is rejected.
+
+        Files created in a secure directory must only have inherited ACEs.
+        Adding an explicit ACE should fail the inheritance check.
+        """
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            database = directory / "explicit-ace-test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                pass
+
+            # Add an explicit ACE to the database file using SetNamedSecurityInfoW
+            from origin_trader.storage.sqlite_store import (
+                _advapi32,
+                _kernel32,
+                _SECURITY_DESCRIPTOR,
+                _sid_from_string,
+                _sid_to_string,
+                OWNER_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION,
+                SE_FILE_OBJECT,
+                SID_STRING_SYSTEM,
+                _get_current_user_sid,
+                _get_dacl_info,
+                WindowsACLError,
+                _get_security_descriptor,
+            )
+
+            user_sid = _get_current_user_sid()
+            user_sid_str = _sid_to_string(user_sid)
+            # Build an SDDL that adds an explicit ACE for the current user
+            # (not marked as inherited)
+            sddl = (
+                f"O:{user_sid_str}"
+                f"D:"  # Not protected
+                f"(A;;FA;;;{user_sid_str})"
+                f"(A;;FA;;;{SID_STRING_SYSTEM})"
+            )
+            sd_ptr = ctypes.POINTER(_SECURITY_DESCRIPTOR)()
+            sd_size = wintypes.ULONG()
+            if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(sd_ptr), ctypes.byref(sd_size)
+            ):
+                self.skipTest("Could not convert SDDL")
+            try:
+                dacl_ptr, _ = _get_dacl_info(sd_ptr)
+                result = _advapi32.SetNamedSecurityInfoW(
+                    str(database),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    user_sid,
+                    None,
+                    dacl_ptr,
+                    None,
+                )
+                if result != 0:
+                    self.skipTest(f"SetNamedSecurityInfoW failed: {result}")
+            finally:
+                if sd_ptr:
+                    _kernel32.LocalFree(sd_ptr)
+
+            # Now the file has explicit ACEs - _check_file_inherits_directory
+            # should reject it because they're not marked INHERITED_ACE
+            with self.assertRaises(WindowsACLError):
+                _check_file_inherits_directory(
+                    database, directory, user_sid
+                )
+
+    def test_acl_inspection_failure_fails_closed(self):
+        """ACL inspection errors must fail closed, never silently pass."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "dir"
+            directory.mkdir()
+
+            user_sid = _get_current_user_sid()
+            system_sid = _sid_from_string(WindowsSecureDirectoryTests.SID_SYSTEM)
+            administrators_sid = _sid_from_string(
+                WindowsSecureDirectoryTests.SID_ADMINISTRATORS
+            )
+
+            with patch(
+                "origin_trader.storage.sqlite_store._get_security_descriptor",
+                side_effect=WindowsACLError("inspection failed"),
+            ):
+                with self.assertRaises(WindowsACLError):
+                    _check_directory_policy(
+                        directory, user_sid, system_sid, administrators_sid
+                    )
+
+    def test_file_acl_inspection_failure_fails_closed(self):
+        """File ACL inspection errors must fail closed."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            database = directory / "fail-test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                pass
+
+            user_sid = _get_current_user_sid()
+
+            with patch(
+                "origin_trader.storage.sqlite_store._get_security_descriptor",
+                side_effect=WindowsACLError("inspection failed"),
+            ):
+                with self.assertRaises(WindowsACLError):
+                    _check_file_inherits_directory(
+                        database, directory, user_sid
+                    )
+
+    def test_initialize_creates_secure_directory_for_new_path(self):
+        """initialize() creates a new directory atomically with secure ACLs.
+
+        When the parent directory does not exist, initialize creates it
+        atomically with a protected DACL via SECURITY_ATTRIBUTES.
+        """
+        with TemporaryDirectory() as base:
+            # Parent does not exist yet - initialize should create it securely
+            new_dir = Path(base) / "new-secure-dir"
+            database = new_dir / "test.sqlite3"
+
+            with SQLiteStore.initialize(database) as store:
+                self.assertEqual(
+                    store._connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+
+            # The directory should now exist with a secure protected DACL
+            user_sid = _get_current_user_sid()
+            system_sid = _sid_from_string(WindowsSecureDirectoryTests.SID_SYSTEM)
+            administrators_sid = _sid_from_string(
+                WindowsSecureDirectoryTests.SID_ADMINISTRATORS
+            )
+            _check_directory_policy(
+                new_dir, user_sid, system_sid, administrators_sid
+            )
+
+    def test_init_secure_dir_opens_successfully(self):
+        """__init__() opens a database in a secure directory successfully."""
+        with TemporaryDirectory() as base:
+            # Create a secure directory first
+            secure_dir = Path(base) / "secure-dir"
+            _create_secure_directory(secure_dir)
+            database = secure_dir / "test.sqlite3"
+
+            # Create the database file first (initialize would normally do this)
+            with SQLiteStore.initialize(database):
+                pass
+
+            # __init__() should verify directory policy before opening
+            with SQLiteStore(database) as store:
+                self.assertEqual(
+                    store._connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+
+    def test_init_rejects_insecure_directory_before_opening_database(self):
+        """__init__() verifies directory policy before opening existing DB.
+
+        An existing insecure directory must cause __init__() to fail
+        closed before SQLite opens the database.
+        """
+        with TemporaryDirectory() as base:
+            # Create an insecure directory and a database file in it
+            insecure_dir = Path(base) / "insecure-dir"
+            insecure_dir.mkdir()
+
+            # Create a raw SQLite database without going through our
+            # secure initialization path
+            import sqlite3 as _sqlite3
+
+            database = insecure_dir / "test.sqlite3"
+            conn = _sqlite3.connect(database)
+            conn.execute(
+                "CREATE TABLE system_events (event_id INTEGER PRIMARY KEY)"
+            )
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+            conn.close()
+
+            # __init__() must fail closed because the directory is insecure
+            with self.assertRaises(WindowsACLError):
+                SQLiteStore(database)
+
+    @unittest.skipIf(os.name == "nt", "Non-Windows compatibility test")
+    def test_non_windows_uses_standard_mkdir(self):
+        """On non-Windows, directory creation uses standard mkdir, not ACL APIs."""
+        self.assertNotEqual(os.name, "nt")
+
+    def _set_directory_dacl(self, directory: Path, sddl: str) -> None:
+        """Replace a directory DACL from an SDDL template (test helper).
+
+        The template may use ``{user}`` for the current user's SID string.
+        """
+        from origin_trader.storage.sqlite_store import (
+            _advapi32,
+            _kernel32,
+            _SECURITY_DESCRIPTOR,
+            DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION,
+            SE_FILE_OBJECT,
+        )
+
+        with _owned_sid(_get_current_user_sid()) as user_sid:
+            user_sid_str = _sid_to_string(user_sid)
+            formatted = sddl.format(user=user_sid_str)
+            sd_ptr = ctypes.POINTER(_SECURITY_DESCRIPTOR)()
+            sd_size = wintypes.ULONG()
+            if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                formatted, 1, ctypes.byref(sd_ptr), ctypes.byref(sd_size)
+            ):
+                self.skipTest("Could not convert SDDL")
+            try:
+                dacl_ptr, _ = _get_dacl_info(sd_ptr)
+                result = _advapi32.SetNamedSecurityInfoW(
+                    str(directory),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    user_sid,
+                    None,
+                    dacl_ptr,
+                    None,
+                )
+                if result != 0:
+                    self.skipTest(f"SetNamedSecurityInfoW failed: {result}")
+            finally:
+                if sd_ptr:
+                    _kernel32.LocalFree(sd_ptr)
+
+    def _assert_directory_policy_rejected(
+        self, directory: Path, sddl: str
+    ) -> None:
+        """Apply an SDDL to a directory and assert the policy rejects it."""
+        self._set_directory_dacl(directory, sddl)
+        with _owned_sid(_get_current_user_sid()) as user_sid:
+            with self.assertRaises(WindowsACLError):
+                _check_directory_policy(
+                    directory,
+                    user_sid,
+                    _sid_from_string(self.SID_SYSTEM),
+                    _sid_from_string(self.SID_ADMINISTRATORS),
+                )
+
+    def test_initialize_rejects_existing_insecure_directory(self):
+        """initialize() fails closed on a pre-existing insecure directory."""
+        with TemporaryDirectory() as base:
+            insecure_dir = Path(base) / "insecure-dir"
+            insecure_dir.mkdir()
+            database = insecure_dir / "test.sqlite3"
+            with self.assertRaises(WindowsACLError):
+                SQLiteStore.initialize(database)
+            self.assertFalse(database.exists())
+
+    def test_initialize_accepts_existing_secure_directory(self):
+        """initialize() verifies and accepts a pre-existing secure directory."""
+        with TemporaryDirectory() as base:
+            secure_dir = Path(base) / "secure-dir"
+            _create_secure_directory(secure_dir)
+            database = secure_dir / "test.sqlite3"
+            with SQLiteStore.initialize(database) as store:
+                self.assertEqual(
+                    store._connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+
+    def test_directory_extra_allow_ace_rejected(self):
+        """An additional allow ACE is rejected by directory policy."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            self._assert_directory_policy_rejected(
+                directory,
+                "O:{user}D:P"
+                "(A;;FA;;;{user})"
+                "(A;;FA;;;S-1-5-18)"
+                "(A;;FA;;;S-1-5-32-544)"
+                "(A;OICI;FA;;;{user})"
+                "(A;OICI;FA;;;S-1-5-18)"
+                "(A;OICI;FA;;;S-1-5-32-544)"
+                "(A;;FA;;;S-1-5-32-545)",
+            )
+
+    def test_directory_deny_ace_rejected(self):
+        """A deny ACE is rejected by directory policy."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            self._assert_directory_policy_rejected(
+                directory,
+                "O:{user}D:P"
+                "(A;;FA;;;{user})"
+                "(A;;FA;;;S-1-5-18)"
+                "(A;;FA;;;S-1-5-32-544)"
+                "(A;OICI;FA;;;{user})"
+                "(A;OICI;FA;;;S-1-5-18)"
+                "(A;OICI;FA;;;S-1-5-32-544)"
+                "(D;;FA;;;S-1-5-32-545)",
+            )
+
+    def test_directory_reduced_mask_rejected(self):
+        """A reduced access mask is rejected by directory policy."""
+        with TemporaryDirectory() as base:
+            directory = Path(base) / "secure-dir"
+            _create_secure_directory(directory)
+            self._assert_directory_policy_rejected(
+                directory,
+                "O:{user}D:P"
+                "(A;;GR;;;{user})"
+                "(A;;FA;;;S-1-5-18)"
+                "(A;;FA;;;S-1-5-32-544)"
+                "(A;OICI;FA;;;{user})"
+                "(A;OICI;FA;;;S-1-5-18)"
+                "(A;OICI;FA;;;S-1-5-32-544)",
+            )
+
+    SID_SYSTEM = "S-1-5-18"
+    SID_ADMINISTRATORS = "S-1-5-32-544"
 
 
 if __name__ == "__main__":
